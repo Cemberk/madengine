@@ -351,6 +351,15 @@ def main():
     parser_run.add_argument('--cache-max-size-gb', type=float, default=100.0, help="maximum total cache size in GB (default: 100)")
     parser_run.add_argument('--force-rebuild', action='store_true', help="force rebuild ignoring cache")
     parser_run.add_argument('--from-cache', metavar='CACHE_ID', default=None, help="run directly from cached entry (cache ID from 'madengine cache list')")
+    # New-path flags: switch between legacy (run.sh + Dockerfile) and new (aiworkloads + aiimagebuilder)
+    parser_run.add_argument('--use-aiworkloads', action='store_true',
+                            help="Use AIWorkloads CLI to generate run scripts instead of run.sh (requires aiworkloads in PATH)")
+    parser_run.add_argument('--use-aiimagebuilder', action='store_true',
+                            help="Use AIImageBuilder CLI to build container images instead of docker build (requires aiimagebuilder in PATH)")
+    parser_run.add_argument('--workload-config', default=None,
+                            help="Path to a per-workload madengine.yaml OmegaConf config (overrides auto-discovery)")
+    parser_run.add_argument('--dry-run', action='store_true',
+                            help="Preview what would be executed without running (new-path only)")
     parser_run.set_defaults(func=run_models)
 
     # Discover models command

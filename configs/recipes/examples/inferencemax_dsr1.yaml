@@ -1,0 +1,46 @@
+name: inferencemax_dsr1
+description: "DeepSeek-R1 FP8 inference on MI300X via SGLang"
+
+# AIImageBuilder config (replaces Dockerfile)
+image_build:
+  enabled: true
+  tag_prefix: "inferencemax-dsr1"
+  runtime: rocm
+  components:
+    sglang:
+      enabled: true
+      version: "v0.4.5"
+    pytorch:
+      enabled: true
+
+# AIWorkloads config (replaces run.sh)
+workload_run:
+  enabled: true
+  scheduler: local
+  model: deepseek-ai/DeepSeek-R1
+  container:
+    runtime: rocm
+  distributed:
+    gpus_per_node: 8
+    tp: 8
+
+# madengine-managed sections
+skip_image_build: false
+
+training:
+  container:
+    runtime: rocm
+  model: deepseek-ai/DeepSeek-R1
+
+# Arbitrary extensions -- workload-specific knobs
+benchmark:
+  framework: sglang
+  precision: fp8
+  isl: 1024
+  osl: 1024
+  concurrency: 16
+
+metrics:
+  export_formats: [json, csv]
+  patterns:
+    throughput: "throughput[:\\s]+([0-9.]+)"

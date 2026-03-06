@@ -1,0 +1,14 @@
+name: quick_test
+description: "Quick test with pre-built image"
+
+skip_image_build: true
+
+training:
+  container:
+    image: "registry.example.com/training:latest"
+    runtime: rocm
+  model: megatron-lm/llama3/8B
+  scheduler: slurm
+  distributed:
+    num_nodes: 1
+    gpus_per_node: 8

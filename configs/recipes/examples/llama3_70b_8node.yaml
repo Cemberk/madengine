@@ -1,0 +1,29 @@
+name: llama3_70b_8node
+description: "LLaMA 3 70B training on 8 nodes with Megatron-LM"
+
+image:
+  tag_prefix: "llama3-training"
+  runtime: rocm
+  components:
+    pytorch:
+      enabled: true
+      commit: "v2.2.0"
+    megatron:
+      enabled: true
+      branch: "rocm_dev"
+
+training:
+  model: megatron-lm/llama3/70B
+  scheduler: slurm
+  distributed:
+    num_nodes: 8
+    gpus_per_node: 8
+    tp: 8
+    pp: 4
+
+data:
+  provider: nas
+  dataset: llama3_tokenized
+
+metrics:
+  export_formats: [json, csv]

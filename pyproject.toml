@@ -1,70 +1,67 @@
 [build-system]
-requires = ["hatchling", "versioningit"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
 name = "madengine"
-dynamic = ["version"]
-authors = [
-  { name="Advanced Micro Devices", email="mad.support@amd.com" },
-]
-description = "MAD Engine is a set of interfaces to run various AI models from public MAD."
+version = "0.1.0"
+description = "AI Training Orchestration Engine"
 readme = "README.md"
-requires-python = ">=3.8"
-dependencies = [
-  "pandas",
-  "GitPython",
-  "jsondiff",
-  "sqlalchemy",
-  "setuptools-rust",
-  "paramiko",
-  "mysql-connector-python",
-  "pymysql",
-  "tqdm",
-  "pytest",
-  "typing-extensions",
-  "pymongo",
-  "toml",
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "Advanced Micro Devices", email = "mad.support@amd.com"},
 ]
-classifiers = [
-  "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
-  "Operating System :: OS Independent",
+dependencies = [
+    "click>=8.0",
+    "omegaconf>=2.3",
+    "pydantic>=2.0",
+    "pandas",
+    "GitPython",
+    "jsondiff",
+    "sqlalchemy",
+    "paramiko",
+    "pymysql",
+    "tqdm",
+    "pytest",
+    "typing-extensions",
+    "pymongo",
+    "toml",
+]
+
+[project.optional-dependencies]
+mysql = ["sqlalchemy>=2.0", "pymysql>=1.0"]
+mongodb = ["pymongo>=4.0"]
+all = ["madengine[mysql,mongodb]"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
 ]
 
 [project.scripts]
+# Legacy entry point (backwards compatible)
 madengine = "madengine.mad:main"
+# New orchestrated pipeline entry point
+madengine-pipeline = "madengine.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/ROCm/madengine"
 Issues = "https://github.com/ROCm/madengine/issues"
 
-[project.extras]
-dev = [
-  "pytest",
-  "pytest-cov",
-  "pytest-xdist",
-  "pytest-timeout",
-  "pytest-mock",
-  "pytest-asyncio",
-]
-
 [tool.hatch.build.targets.wheel]
+packages = ["src/madengine"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/madengine/scripts" = "madengine/scripts"
 
-[tool.hatch.version]
-source = "versioningit"
+[tool.ruff]
+target-version = "py310"
+line-length = 100
 
-[tool.versioningit.vcs]
-method = "git"
-default-tag = "v1.0.0"
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
 
-[tool.versioningit.tag2version]
-regex = "v(?P<version>.*)"
-
-[tool.versioningit.format]
-distance = "{base_version}.post{distance}+{vcs}{rev}"
-dirty = "{base_version}+d{build_date:%Y%m%d}"
-distance-dirty = "{base_version}.post{distance}+{vcs}{rev}.d{build_date:%Y%m%d}"
+[tool.pytest.ini_options]
+testpaths = ["tests"]

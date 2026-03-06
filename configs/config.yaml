@@ -1,0 +1,116 @@
+defaults:
+  - _self_
+
+# Pipeline control
+dry_run: false
+skip_image_build: false
+output_format: text  # text | json
+
+# External tool configuration
+tools:
+  aiimagebuilder:
+    executable: "aiimagebuilder"
+  aiworkloads:
+    executable: "aiworkloads"
+
+# Timeouts (seconds)
+timeouts:
+  image_build: 7200
+  job_execution: 86400
+  data_staging: 3600
+
+# Retry policy
+retry:
+  enabled: true
+  max_attempts: 3
+  backoff_seconds: 60
+
+# Credentials configuration
+credentials:
+  git:
+    token_env: "GITHUB_TOKEN"
+    token_file: null
+  registry:
+    docker_config: "~/.docker/config.json"
+
+# Data provider configuration
+data:
+  provider: local
+
+  local:
+    base_path: "/data"
+
+  nas:
+    host: null
+    user: null
+    key_file: "~/.ssh/id_rsa"
+    remote_path: "/shared/datasets"
+    local_cache: "/tmp/data_cache"
+    sync_enabled: true
+
+  s3:
+    bucket: null
+    region: "us-east-1"
+    access_key_env: "AWS_ACCESS_KEY_ID"
+    secret_key_env: "AWS_SECRET_ACCESS_KEY"
+    local_cache: "/tmp/data_cache"
+
+  minio:
+    endpoint: null
+    bucket: null
+    access_key_env: "MINIO_ACCESS_KEY"
+    secret_key_env: "MINIO_SECRET_KEY"
+    local_cache: "/tmp/data_cache"
+
+# Database configuration
+database:
+  backend: mongodb
+
+  mysql:
+    host: "localhost"
+    port: 3306
+    database: "madengine"
+    user_env: "MYSQL_USER"
+    password_env: "MYSQL_PASSWORD"
+
+  mongodb:
+    uri_env: "MONGODB_URI"
+    uri: "mongodb://localhost:27017"
+    database: "madengine"
+    collection: "runs"
+
+# Metrics configuration
+metrics:
+  enabled: true
+  export_formats: [json]
+  output_dir: "./results"
+
+  patterns:
+    throughput: "throughput[:\\s]+([0-9.]+)"
+    loss: "loss[:\\s]+([0-9.]+)"
+    gpu_memory: "memory[:\\s]+([0-9.]+)"
+
+# Reporting configuration
+reporting:
+  csv:
+    enabled: true
+  html:
+    enabled: false
+    template: null
+  email:
+    enabled: false
+    smtp_host: null
+    smtp_port: 587
+    from_address: null
+    to_addresses: []
+
+# Paths
+paths:
+  cache: "~/.cache/madengine"
+  recipes: "~/.config/madengine/recipes"
+  logs: "~/.local/share/madengine/logs"
+
+# Logging
+logging:
+  level: INFO
+  file: null

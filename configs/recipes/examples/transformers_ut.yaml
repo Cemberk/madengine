@@ -1,0 +1,35 @@
+name: transformers_ut
+description: "HuggingFace transformers unit tests with pytest-fkit"
+
+skip_image_build: true
+
+training:
+  container:
+    image: "rocm/pytorch:latest"
+    runtime: rocm
+  model: transformers_ut
+
+workload_run:
+  enabled: true
+  scheduler: local
+  model: transformers_ut
+  distributed:
+    gpus_per_node: 8
+
+# Extension: pytest-fkit configuration
+pytest_fkit:
+  enabled: true
+  timeout: 600
+  workers: auto
+  gpus_per_worker: 2
+  crash_isolation: true
+
+# Extension: test bucketing config
+test_bucketing:
+  bucket: run_critical
+  priority_models:
+    - bert
+    - llama
+    - gemma3
+    - qwen2
+    - whisper

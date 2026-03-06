@@ -53,6 +53,7 @@ from madengine.core.timeout import Timeout
 from madengine.tools.update_perf_csv import update_perf_csv
 from madengine.tools.csv_to_html import convert_csv_to_html
 from madengine.tools.discover_models import DiscoverModels
+from madengine.tooling.bridge import AdapterBridge
 
 
 class RunDetails:
@@ -182,6 +183,16 @@ class RunModels:
                 console=self.console
             )
             print(f"Cache enabled: {self.cache_manager.cache_base_dir}")
+
+        # Initialize adapter bridge for new-path flags (--use-aiworkloads, --use-aiimagebuilder)
+        self.bridge = AdapterBridge(args)
+        if self.bridge.is_new_path:
+            flags = []
+            if self.bridge.use_aiimagebuilder:
+                flags.append("aiimagebuilder")
+            if self.bridge.use_aiworkloads:
+                flags.append("aiworkloads")
+            print(f"New-path enabled: {', '.join(flags)}")
 
         print(f"Context is {self.context.ctx}")
 
@@ -566,9 +577,23 @@ class RunModels:
             info: The model information.
             dockerfile: The docker file.
             run_details: The run details.
+
+        When --use-aiimagebuilder is set, delegates image building to AIImageBuilder.
+        When --use-aiworkloads is set, delegates script execution to AIWorkloads.
+        Both can be used together or independently, falling back to legacy for the other.
         """
         print("")
         print(f"Running model {info['name']} on container built from {dockerfile}")
+
+        # Load per-workload OmegaConf config (madengine.yaml next to run.sh)
+        workload_cfg = None
+        if self.bridge.is_new_path:
+            workload_cfg = self.bridge.load_workload_config(info)
+            if workload_cfg:
+                print(f"Loaded per-workload config for {info['name']}")
+                extensions = self.bridge.get_extensions(workload_cfg)
+                if extensions:
+                    print(f"Workload extensions: {list(extensions.keys())}")
 
         if "MAD_CONTAINER_IMAGE" not in self.context.ctx:
             # build docker image
@@ -650,26 +675,38 @@ class RunModels:
 
             # Build docker container if not using cached image
             if not use_cached_image:
-                print(f"Building Docker image...")
-                build_start_time = time.time()
+                # === NEW PATH: AIImageBuilder ===
+                if self.bridge.use_aiimagebuilder:
+                    print(f"Building Docker image via AIImageBuilder...")
+                    ib_result = self.bridge.build_image(info, self.context.ctx, workload_cfg)
+                    if not ib_result.success:
+                        raise RuntimeError(f"AIImageBuilder failed: {ib_result.error}")
+                    run_details.docker_image = ib_result.image_tag
+                    run_details.build_duration = ib_result.build_duration
+                    print(f"AIImageBuilder produced image: {run_details.docker_image}")
+                    print(f"Build Duration: {run_details.build_duration} seconds")
+                # === LEGACY PATH: docker build ===
+                else:
+                    print(f"Building Docker image...")
+                    build_start_time = time.time()
 
-                ## Note: --network=host added to fix issue on CentOS+FBK kernel, where iptables is not available
-                self.console.sh(
-                    "docker build "
-                    + use_cache_str
-                    + " --network=host "
-                    + " -t "
-                    + run_details.docker_image
-                    + " --pull -f "
-                    + dockerfile
-                    + " "
-                    + build_args
-                    + " "
-                    + docker_context,
-                    timeout=None,
-                )
-                run_details.build_duration = time.time() - build_start_time
-                print(f"Build Duration: {run_details.build_duration} seconds")
+                    ## Note: --network=host added to fix issue on CentOS+FBK kernel, where iptables is not available
+                    self.console.sh(
+                        "docker build "
+                        + use_cache_str
+                        + " --network=host "
+                        + " -t "
+                        + run_details.docker_image
+                        + " --pull -f "
+                        + dockerfile
+                        + " "
+                        + build_args
+                        + " "
+                        + docker_context,
+                        timeout=None,
+                    )
+                    run_details.build_duration = time.time() - build_start_time
+                    print(f"Build Duration: {run_details.build_duration} seconds")
 
                 # Save to cache if caching is enabled
                 if self.cache_manager:
@@ -957,8 +994,20 @@ class RunModels:
             # run model
             test_start_time = time.time()
             if not self.args.skip_model_run:
-                print("Running model...")
-                if "model_args" in self.context.ctx:
+                # === NEW PATH: AIWorkloads ===
+                if self.bridge.use_aiworkloads:
+                    print("Running model via AIWorkloads...")
+                    aw_result = self.bridge.run_workload(
+                        info, run_details.docker_image, self.context.ctx, workload_cfg
+                    )
+                    if not aw_result.success:
+                        raise RuntimeError(f"AIWorkloads failed: {aw_result.error}")
+                    print(f"AIWorkloads submit command: {aw_result.submit_command}")
+                    if aw_result.stdout:
+                        print(aw_result.stdout)
+                # === LEGACY PATH: bash run.sh ===
+                elif "model_args" in self.context.ctx:
+                    print("Running model...")
                     model_docker.sh(
                         "cd "
                         + model_dir
@@ -969,6 +1018,7 @@ class RunModels:
                         timeout=None,
                     )
                 else:
+                    print("Running model...")
                     model_docker.sh(
                         "cd " + model_dir + " && " + script_name + " " + info["args"],
                         timeout=None,
