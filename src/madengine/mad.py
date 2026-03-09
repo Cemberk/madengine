@@ -360,6 +360,13 @@ def main():
                             help="Path to a per-workload madengine.yaml OmegaConf config (overrides auto-discovery)")
     parser_run.add_argument('--dry-run', action='store_true',
                             help="Preview what would be executed without running (new-path only)")
+    # Model optimization options
+    parser_run.add_argument('--optimizer', choices=['aitemplate', 'tensorrt', 'migraphx', 'auto'], default=None,
+                            help="Optimizer backend to use (aitemplate, tensorrt, migraphx, auto)")
+    parser_run.add_argument('--optimize-only', action='store_true',
+                            help="Only compile/optimize, don't run benchmark")
+    parser_run.add_argument('--compare', action='store_true',
+                            help="Run both original and optimized versions for comparison")
     parser_run.set_defaults(func=run_models)
 
     # Discover models command

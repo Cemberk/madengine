@@ -54,6 +54,7 @@ from madengine.tools.update_perf_csv import update_perf_csv
 from madengine.tools.csv_to_html import convert_csv_to_html
 from madengine.tools.discover_models import DiscoverModels
 from madengine.tooling.bridge import AdapterBridge
+from madengine.tools.optimizer_bridge import OptimizerBridge, get_optimizer_registry
 
 
 class RunDetails:
@@ -194,6 +195,9 @@ class RunModels:
                 flags.append("aiworkloads")
             print(f"New-path enabled: {', '.join(flags)}")
 
+        # Initialize optimizer bridge when optimization flags are set
+        self.optimizer_bridge = OptimizerBridge(args) if hasattr(args, "optimizer") else None
+
         print(f"Context is {self.context.ctx}")
 
     def get_base_prefix_compat(self):
@@ -215,6 +219,36 @@ class RunModels:
             bool: The status of the current environment.
         """
         return self.get_base_prefix_compat() != sys.prefix
+
+    def _get_workload_config_dict(self, model_info: typing.Dict) -> typing.Dict | None:
+        """Get workload config as plain dict for optimizer bridge."""
+        # From --workload-config path
+        raw = model_info.get("workload_config")
+        if raw is not None:
+            try:
+                from omegaconf import OmegaConf
+                return OmegaConf.to_container(raw, resolve=True) if hasattr(raw, "get") else raw
+            except Exception:
+                return raw if isinstance(raw, dict) else None
+        # From bridge (madengine.yaml in scripts dir)
+        if self.bridge and self.bridge.is_new_path:
+            cfg = self.bridge.load_workload_config(model_info)
+            if cfg is not None:
+                try:
+                    from omegaconf import OmegaConf
+                    return OmegaConf.to_container(cfg, resolve=True)
+                except Exception:
+                    return None
+        return None
+
+    def _should_use_optimizer(self, model_info: typing.Dict, workload_config: typing.Dict | None) -> bool:
+        """True if --optimizer is set or config has optimization section."""
+        if not self.optimizer_bridge:
+            return False
+        if getattr(self.args, "optimizer", None):
+            return True
+        config = workload_config or model_info
+        return self.optimizer_bridge._has_optimization_config(config)
 
     def clean_up_docker_container(self, is_cleaned: bool = False) -> None:
         """Clean up docker container."""
@@ -1125,6 +1159,35 @@ class RunModels:
                 f"Running model {run_details.model} on {run_details.gpu_architecture} architecture."
             )
 
+            workload_config = self._get_workload_config_dict(model_info)
+            if self._should_use_optimizer(model_info, workload_config):
+                opt_result = self.optimizer_bridge.execute_optimization(
+                    model_info, workload_config, self.context.ctx
+                )
+                if getattr(self.args, "optimize_only", False):
+                    print(f"Optimize-only mode: skipping benchmark for {run_details.model}")
+                    run_details.performance = opt_result.optimized_performance or "N/A"
+                    run_details.metric = "latency_ms"
+                    run_details.status = "SUCCESS" if opt_result.success else "FAILURE"
+                    run_details.generate_json("perf_entry.json")
+                    update_perf_csv(single_result="perf_entry.json", perf_csv=self.args.output)
+                    if not opt_result.success and opt_result.error:
+                        print(f"Optimizer error: {opt_result.error}")
+                        self.return_status = False
+                    return self.return_status
+                if not getattr(self.args, "compare", False):
+                    print(f"Running optimized benchmark for {run_details.model}")
+                    run_details.performance = opt_result.optimized_performance or "N/A"
+                    run_details.metric = "latency_ms"
+                    run_details.status = "SUCCESS" if opt_result.success else "FAILURE"
+                    run_details.generate_json("perf_entry.json")
+                    update_perf_csv(single_result="perf_entry.json", perf_csv=self.args.output)
+                    if not opt_result.success and opt_result.error:
+                        print(f"Optimizer error: {opt_result.error}")
+                        self.return_status = False
+                    return self.return_status
+                # compare mode: run full docker flow first, then optimizer; handled below
+
             try:
                 # clean up docker
                 self.clean_up_docker_container()
@@ -1211,6 +1274,26 @@ class RunModels:
 
                         # print stage perf results
                         run_details.print_perf()
+
+                        # Compare mode: run optimizer and generate comparison report
+                        if (
+                            getattr(self.args, "compare", False)
+                            and self._should_use_optimizer(model_info, workload_config)
+                        ):
+                            opt_result = self.optimizer_bridge.execute_optimization(
+                                model_info, workload_config, self.context.ctx
+                            )
+                            report_path = self.optimizer_bridge.generate_comparison_report(
+                                original_result={
+                                    "performance": run_details.performance,
+                                    "metric": run_details.metric,
+                                    "status": run_details.status,
+                                    "test_duration": run_details.test_duration,
+                                },
+                                optimized_result=opt_result,
+                                output_path=f"{run_details.model}_optimization_comparison.json",
+                            )
+                            print(f"Comparison report: {report_path}")
 
                         # add result to output
                         if multiple_results:
@@ -1435,8 +1518,47 @@ class RunModels:
         # copy scripts to model directory
         self.copy_scripts()
 
-        discover_models = DiscoverModels(args=self.args)
-        models = discover_models.run()
+        # Check if running from a workload YAML config instead of models.json
+        workload_config_path = getattr(self.args, 'workload_config', None)
+        if workload_config_path and os.path.exists(workload_config_path):
+            from madengine.tooling.config_converter import (
+                load_yaml_config,
+                config_to_model_info,
+                config_to_context_dict,
+            )
+            print(f"Loading workload config from: {workload_config_path}")
+            raw_config = load_yaml_config(workload_config_path)
+            model_info = config_to_model_info(raw_config)
+
+            # Merge custom fields into context as docker_env_vars / docker_build_arg
+            extra_context = config_to_context_dict(raw_config)
+            if extra_context:
+                if "docker_env_vars" in extra_context:
+                    if "docker_env_vars" not in self.context.ctx:
+                        self.context.ctx["docker_env_vars"] = {}
+                    for k, v in extra_context["docker_env_vars"].items():
+                        if k not in self.context.ctx["docker_env_vars"]:
+                            self.context.ctx["docker_env_vars"][k] = v
+                if "docker_build_arg" in extra_context:
+                    if "docker_build_arg" not in self.context.ctx:
+                        self.context.ctx["docker_build_arg"] = {}
+                    for k, v in extra_context["docker_build_arg"].items():
+                        if k not in self.context.ctx["docker_build_arg"]:
+                            self.context.ctx["docker_build_arg"][k] = v
+                print(f"Merged custom context from config: {list(extra_context.keys())}")
+
+            # Pass raw config for optimizer bridge (optimization section)
+            try:
+                from omegaconf import OmegaConf
+                model_info["workload_config"] = OmegaConf.to_container(raw_config, resolve=True)
+            except Exception:
+                model_info["workload_config"] = raw_config if isinstance(raw_config, dict) else {}
+
+            models = [model_info]
+            print(f"Running single workload from config: {model_info['name']}")
+        else:
+            discover_models = DiscoverModels(args=self.args)
+            models = discover_models.run()
 
         # create performance csv
         if not os.path.exists(self.args.output):
