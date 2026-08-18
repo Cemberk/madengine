@@ -775,3 +775,109 @@ class TestSlurmMultiPerfAggregation:
         text = Path("perf.csv").read_text()
         assert "old,1.0" in text and "new,2.0" in text
         assert text.count("model,performance") == 1
+
+
+class TestDeclaredNarrowCsvIngestion:
+    """A declared multiple_results CSV is narrow by contract and gets merged.
+
+    This is the path-parity payoff: the workload reports only what it measured, and
+    madengine supplies node/GPU counts, image and provenance it already owns — the
+    same contract the templated launchers use. Previously a self-managed workload
+    hand-wrote the whole 29-column schema, which is how a colocated 2-node run came
+    to describe itself as a 1-node disaggregated one.
+    """
+
+    @pytest.fixture
+    def deployment(self, tmp_path: Path):
+        script_dir = tmp_path / "scripts" / "wl"
+        script_dir.mkdir(parents=True)
+        (script_dir / "run.slurm").write_text("#!/bin/bash\n")
+
+        model = {
+            "name": "wl",
+            "scripts": "scripts/wl/run.slurm",
+            "multiple_results": "perf_WL.csv",
+            "distributed": {"launcher": "slurm_multi", "nnodes": 2},
+            "tags": ["pyt", "vllm"],
+            "args": "",
+        }
+        image = "reg.io/img:tag"
+        manifest = {
+            "built_models": {image: model},
+            "built_images": {image: {"docker_image": image, "base_docker": "base:1"}},
+            "context": {},
+        }
+        manifest_path = tmp_path / "build_manifest.json"
+        manifest_path.write_text(json.dumps(manifest))
+        cfg = DeploymentConfig(
+            target="slurm",
+            manifest_file=str(manifest_path),
+            additional_context={
+                "slurm": {"output_dir": str(tmp_path / "slurm_results")},
+                "distributed": {"launcher": "slurm_multi", "nnodes": 2},
+            },
+        )
+        d = SlurmDeployment(cfg)
+        d.manifest = manifest
+        d.output_dir.mkdir(parents=True, exist_ok=True)
+        d._script_dir = script_dir
+        return d
+
+    def _collect(self, deployment, tmp_path, monkeypatch, body):
+        (deployment._script_dir / "perf_WL.csv").write_text(body)
+        monkeypatch.chdir(tmp_path)
+        return deployment.collect_results("777")
+
+    def test_narrow_csv_gains_madengine_metadata(self, deployment, tmp_path, monkeypatch):
+        import csv as _csv
+        self._collect(deployment, tmp_path, monkeypatch,
+                      "model,performance,metric\nm,12.5,tok/s\n")
+        with open(tmp_path / "perf.csv") as _f:
+            rows = list(_csv.DictReader(_f))
+        row = {k.strip(): v for k, v in rows[0].items() if k}
+        assert row["nnodes"] == "2"
+        assert row["n_gpus"] == "16"
+        assert row["launcher"] == "slurm_multi"
+        assert row["docker_image"] == "reg.io/img:tag"
+        assert row["model"] == "wl_m"
+
+    def test_explicit_failure_survives_ingestion(self, deployment, tmp_path, monkeypatch):
+        import csv as _csv
+        results = self._collect(deployment, tmp_path, monkeypatch,
+                                "model,performance,metric,status\n"
+                                "m,10,needles /10,SUCCESS\n"
+                                "m,0,needles /10,FAILURE\n")
+        with open(tmp_path / "perf.csv") as _f:
+            rows = list(_csv.DictReader(_f))
+        assert [r["status"] for r in rows] == ["SUCCESS", "FAILURE"]
+        assert len(results["successful_runs"]) == 1
+        assert len(results["failed_runs"]) == 1
+
+    def test_full_schema_csv_is_not_re_ingested(self, deployment, tmp_path, monkeypatch):
+        """A full perf.csv declared as multiple_results must fall back, not be merged.
+
+        Merging it would prefix the model name twice and let stale hand-written
+        metadata win over madengine's.
+        """
+        full = (
+            "model,n_gpus,nnodes,deployment_type,launcher,build_number,"
+            "performance,metric,status\n"
+            "m,8,1,disagg_1P0D,slurm_multi,0,10,needles /10,SUCCESS\n"
+        )
+        results = self._collect(deployment, tmp_path, monkeypatch, full)
+        # Fell back to the direct-read path: perf_files points at the source CSV,
+        # not at a freshly merged perf.csv row set.
+        assert results["perf_files"], "should still collect something"
+        assert "perf_WL.csv" in results["perf_files"][0]
+
+    @pytest.mark.parametrize("header,is_full", [
+        ("model,performance,metric", False),
+        ("model,benchmark,context_words,performance,metric,status", False),
+        ("model,performance,metric,build_number", True),
+        ("model,deployment_type,performance,metric", True),
+        (" model , launcher , performance ", True),
+    ])
+    def test_full_schema_detection(self, tmp_path, header, is_full):
+        p = tmp_path / "c.csv"
+        p.write_text(header + "\n")
+        assert SlurmDeployment._csv_is_full_perf_schema(p) is is_full

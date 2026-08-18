@@ -14,6 +14,7 @@ import typing
 # third-party imports
 import pandas as pd
 # MAD Engine imports
+from madengine.reporting.update_perf_csv import resolve_result_status
 from madengine.utils.config_parser import ConfigParser
 
 
@@ -131,11 +132,12 @@ def handle_multiple_results_super(
         else:
             record["multi_results"] = None
         
-        # Set status based on performance
-        if record.get("performance") is not None and pd.notna(record.get("performance")):
-            record["status"] = "SUCCESS"
-        else:
-            record["status"] = "FAILURE"
+        # Status the workload stated explicitly wins; otherwise derive from
+        # performance. Shared with handle_multiple_results() so perf.csv and
+        # perf_super can never disagree about the same row.
+        record["status"] = resolve_result_status(
+            result_row.get("status"), record.get("performance")
+        )
         
         # Match config to this specific result
         if configs_data:

@@ -2173,6 +2173,129 @@ export MASTER_PORT={master_port}
         )
         return None
 
+    # Columns that only appear in a full madengine perf.csv. A declared
+    # multiple_results CSV is supposed to be narrow (the workload measures; madengine
+    # describes the run), so seeing these means the workload is still writing the
+    # whole schema itself and must not be re-ingested through update_perf_csv.
+    _FULL_PERF_SCHEMA_MARKERS = frozenset({"build_number", "deployment_type", "launcher"})
+
+    @staticmethod
+    def _csv_is_full_perf_schema(csv_path: Path) -> bool:
+        """Return True if the CSV carries full perf.csv metadata columns."""
+        import csv as _csv
+
+        try:
+            with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                header = next(_csv.reader(f), []) or []
+        except OSError:
+            return False
+        return bool(
+            SlurmDeployment._FULL_PERF_SCHEMA_MARKERS
+            & {h.strip() for h in header}
+        )
+
+    def _ingest_declared_narrow_csv(
+        self,
+        csv_path: Path,
+        model_info: Dict[str, Any],
+        deployment_id: str,
+        results: Dict[str, Any],
+    ) -> bool:
+        """Merge a narrow results CSV with madengine-supplied metadata.
+
+        This is the same pipeline the templated path uses (update_perf_csv +
+        update_perf_super_*), which is the point: a self-managed workload should only
+        have to report *what it measured* — model, performance, metric, and optionally
+        status — while madengine supplies node counts, GPU counts, image, launcher and
+        build provenance it already knows. Previously the workload hand-wrote all of
+        that into a full perf.csv, which is how a colocated run came to describe itself
+        as a disaggregated one.
+
+        Returns True if the CSV was ingested, False to fall back to a direct read.
+        """
+        from madengine.reporting.update_perf_csv import update_perf_csv
+        from madengine.reporting.update_perf_super import (
+            update_perf_super_csv,
+            update_perf_super_json,
+        )
+        from madengine.utils.config_parser import ConfigParser  # noqa: F401  (parity with templated path)
+
+        if self._csv_is_full_perf_schema(csv_path):
+            self.console.print(
+                f"[yellow]⚠ {csv_path} carries full perf.csv columns but is declared as "
+                f"multiple_results, which expects a narrow CSV (model, performance, "
+                f"metric[, status]). Reading it directly instead of merging.[/yellow]"
+            )
+            return False
+
+        build_info: Dict[str, Any] = {}
+        built_images = self.manifest.get("built_images") or {}
+        if built_images:
+            build_info = next(iter(built_images.values()), {}) or {}
+
+        gpu_arch = self.config.additional_context.get("gpu_architecture", "") or ""
+        common_info = self._build_common_info_dict(
+            model_info, build_info, deployment_id, gpu_arch
+        )
+        common_info_path = Path("common_info.json")
+        with open(common_info_path, "w", encoding="utf-8") as f:
+            json.dump(common_info, f, indent=2)
+
+        model_name = model_info.get("name", "")
+        self._ensure_perf_csv_exists()
+        update_perf_csv(
+            perf_csv="perf.csv",
+            multiple_results=str(csv_path),
+            common_info=str(common_info_path),
+            model_name=model_name,
+        )
+        try:
+            scripts_base_dir = scripts_base_dir_from(model_info.get("scripts", ""))
+            num_entries = update_perf_super_json(
+                perf_super_json="perf_super.json",
+                multiple_results=str(csv_path),
+                common_info=str(common_info_path),
+                model_name=model_name,
+                scripts_base_dir=scripts_base_dir,
+            )
+            update_perf_super_csv(
+                perf_super_json="perf_super.json",
+                perf_super_csv="perf_super.csv",
+                num_entries=num_entries,
+            )
+        except Exception as e:
+            self.console.print(f"[yellow]⚠ Could not update perf_super: {e}[/yellow]")
+
+        results["perf_files"] = [str(Path("perf.csv").resolve())]
+        import csv as _csv
+
+        try:
+            with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
+                for row in _csv.DictReader(f):
+                    row = {k.strip(): v for k, v in row.items() if k}
+                    run_data = {
+                        "model": f"{model_name}_{row.get('model', '')}",
+                        "status": (row.get("status") or "").strip().upper()
+                        or ("SUCCESS" if row.get("performance") else "FAILURE"),
+                        "performance": row.get("performance", ""),
+                        "metric": row.get("metric", ""),
+                        "duration": row.get("test_duration", ""),
+                        "gpu_arch": gpu_arch,
+                        "deployment": self.DEPLOYMENT_TYPE,
+                        "machine": deployment_id,
+                    }
+                    if run_data["status"] == "SUCCESS":
+                        results["successful_runs"].append(run_data)
+                    else:
+                        results["failed_runs"].append(run_data)
+        except Exception as e:
+            self.console.print(f"[yellow]⚠ Could not parse {csv_path}: {e}[/yellow]")
+
+        self.console.print(
+            f"[green]✓ Merged {csv_path.name} with run metadata into perf.csv / perf_super.*[/green]"
+        )
+        return True
+
     def _collect_slurm_multi_results(
         self,
         deployment_id: str,
@@ -2183,9 +2306,13 @@ export MASTER_PORT={master_port}
         """
         Collect results for slurm_multi launchers.
 
-        slurm_multi model scripts generate their own perf.csv via their
-        benchmark scripts (e.g. generate_perf_csv.py). We collect SLURM
-        logs for diagnostics and read the model-generated perf.csv for metrics.
+        Two shapes are supported, selected by whether the model card declares
+        ``multiple_results``:
+
+        * **Declared** — the workload writes a narrow CSV and madengine merges it with
+          the run metadata it already knows, exactly as on the templated path.
+        * **Undeclared** — legacy: the workload writes a full perf.csv to one of the
+          conventional locations and madengine reads it as-is.
         """
         # Collect SLURM output logs for diagnostics
         flat_out_files = sorted(self.output_dir.glob(f"madengine-*_{deployment_id}_*.out"))
@@ -2193,8 +2320,14 @@ export MASTER_PORT={master_port}
 
         # A model card that names its own results CSV wins over the conventional
         # locations below, so a workload is not forced to write to a path madengine
-        # happens to know about.
+        # happens to know about. A declared CSV is narrow by contract and gets merged
+        # with run metadata; only fall through if that merge declines it.
         perf_csv_path = self._slurm_multi_declared_result_csv(model_info, deployment_id)
+        if perf_csv_path and model_info:
+            if self._ingest_declared_narrow_csv(
+                perf_csv_path, model_info, deployment_id, results
+            ):
+                return results
 
         # Look for model-generated perf.csv. Inner scripts in MAD-private write
         # to one of these locations depending on the workload:

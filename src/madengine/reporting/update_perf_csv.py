@@ -24,6 +24,29 @@ PERF_CSV_HEADER = (
 )
 
 
+def resolve_result_status(declared_status: typing.Any, performance: typing.Any) -> str:
+    """Decide a result row's status, preferring one the workload stated explicitly.
+
+    Status was always derived from ``performance``: any non-null value meant SUCCESS.
+    That is a safe default for throughput benchmarks, where a missing number is the
+    only way to fail, but it is wrong for accuracy benchmarks where **zero is a real
+    measurement of a real failure** — an NIAH context size whose request errored
+    scores 0, which is not-null and would be recorded as SUCCESS, hiding exactly the
+    pass→crash regression the row exists to catch.
+
+    A results CSV may therefore carry a ``status`` column to state the outcome
+    itself. When absent or blank the derivation below is unchanged, so producers that
+    never emit one behave exactly as before.
+    """
+    if declared_status is not None and pd.notna(declared_status):
+        text = str(declared_status).strip()
+        if text:
+            return text.upper()
+    if performance is not None and pd.notna(performance):
+        return "SUCCESS"
+    return "FAILURE"
+
+
 def df_strip_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Strip the column names of a DataFrame.
 
@@ -131,10 +154,7 @@ def handle_multiple_results(
         for key, value in r.items():
             row[key] = value
 
-        if row.get("performance") is not None and pd.notna(row.get("performance")):
-            row["status"] = "SUCCESS"
-        else:
-            row["status"] = "FAILURE"
+        row["status"] = resolve_result_status(r.get("status"), row.get("performance"))
 
         # Ensure all values are scalars (convert lists to strings)
         for key, value in row.items():

@@ -666,12 +666,32 @@ fields are honoured identically on both paths:
 > the job runs on the `slurm.nodes` default of 1. Size the allocation with
 > `distributed.nnodes` (or `slurm.nodes`) instead.
 
-> **`multiple_results` is read directly here.** On the templated path the CSV is
-> narrow and gets merged with `common_info` by `update_perf_csv`. A self-managed
-> script has no `common_info` to merge against, so it writes the full perf schema
-> itself and madengine reads it as-is — routing it through `handle_multiple_results()`
-> would recompute `status` from `performance` and flip a legitimate zero-score
-> FAILURE row to SUCCESS.
+**Results contract — one schema on both paths.** A declared `multiple_results` CSV
+is **narrow** whichever launcher produced it: the workload reports only what it
+measured, and madengine merges in the run metadata it already owns.
+
+| Supplied by the workload | Supplied by madengine |
+|---|---|
+| `model`, `performance`, `metric` (required) | node/GPU counts, `launcher`, `deployment_type` |
+| `status` (optional, see below) | image, base image, docker sha, build provenance |
+| any descriptive columns (`tp`, `inp`, `context_words`, …) | tags, pipeline, build number |
+
+This is why the contract matters rather than being cosmetic: a self-managed workload
+cannot know its own node count reliably, and when it guessed, a colocated 2-node run
+reported itself as a 1-node disaggregated one.
+
+> **`status` is honoured when present.** Status is otherwise derived from
+> `performance`, where any non-null value means SUCCESS. That is right for
+> throughput but wrong for accuracy benchmarks, where **zero is a real measurement of
+> a real failure** — an NIAH context size whose request errored scores 0 and would be
+> recorded as SUCCESS, hiding the pass→crash regression the row exists to catch. A
+> producer that emits no `status` column behaves exactly as before.
+
+> **Legacy full-schema CSVs still work.** A model card that declares *no*
+> `multiple_results` keeps the old behaviour: it writes a complete perf.csv to one of
+> the conventional locations and madengine reads it as-is. If a full-schema CSV is
+> declared as `multiple_results`, madengine warns and falls back to a direct read
+> rather than double-merging it.
 
 > **Preset selection still keys on `slurm.nodes`.** `ConfigLoader` picks the
 > single-node vs multi-node preset before `nnodes` reconciliation, so a card sized
