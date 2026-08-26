@@ -75,6 +75,23 @@ class SlurmDeployment(BaseDeployment):
         self.partition = self.slurm_config.get("partition", "gpu")
         self.nodes = self.slurm_config.get("nodes", 1)
         self.gpus_per_node = self.slurm_config.get("gpus_per_node", 8)
+
+        # A launcher that declares distributed.nnodes cannot run in a smaller
+        # allocation. slurm.nodes is what sizes the job (#SBATCH --nodes), and it
+        # defaults to 1 via the preset chain, so a model card carrying only
+        # distributed.nnodes would silently be submitted as a 1-node job and fail
+        # inside the launcher after the allocation was granted. Grow the
+        # allocation to match rather than fail late; never shrink it, so an
+        # explicitly larger slurm.nodes still wins.
+        declared_nnodes = self.distributed_config.get("nnodes")
+        if isinstance(declared_nnodes, int) and declared_nnodes > self.nodes:
+            self.console.print(
+                f"[yellow]slurm.nodes={self.nodes} is smaller than "
+                f"distributed.nnodes={declared_nnodes}; sizing the allocation "
+                f"from nnodes. Set slurm.nodes explicitly to override.[/yellow]"
+            )
+            self.nodes = declared_nnodes
+            self.slurm_config["nodes"] = declared_nnodes
         self.time_limit = self.slurm_config.get("time", "24:00:00")
         self.output_dir = Path(self.slurm_config.get("output_dir", "./slurm_results"))
         self.reservation = self.slurm_config.get("reservation", None)
@@ -368,7 +385,7 @@ class SlurmDeployment(BaseDeployment):
 
             # Save script
             self.script_path = self.output_dir / f"madengine_{model_info['name']}.sh"
-            self.script_path.write_text(script_content)
+            self.script_path.write_text(script_content, encoding="utf-8")
             self.script_path.chmod(0o755)
 
             self.console.print(
@@ -487,10 +504,18 @@ class SlurmDeployment(BaseDeployment):
         if self.slurm_config.get("exclusive", True):
             script_lines.append("#SBATCH --exclusive")
         
+        # Accounting. The templated launchers emit these from job.sh.j2; this
+        # hand-built header omitted them, so slurm_multi was unusable on any
+        # cluster that requires an association.
+        if self.slurm_config.get("account"):
+            script_lines.append(f"#SBATCH --account={self.slurm_config['account']}")
+        if self.slurm_config.get("qos"):
+            script_lines.append(f"#SBATCH --qos={self.slurm_config['qos']}")
+
         # Add reservation if specified
         if self.reservation:
             script_lines.append(f"#SBATCH --reservation={self.reservation}")
-        
+
         # Add nodelist if specified (from model card or --additional-context)
         nodelist = self._normalize_nodelist(self.slurm_config.get("nodelist"))
         if nodelist:
@@ -611,12 +636,20 @@ class SlurmDeployment(BaseDeployment):
         self._completion_marker = (
             completion_marker_dir / f"madengine_{model_info['name']}_local.complete"
         )
-        
+
+        # Remember where the launcher runs and what results file the model card
+        # declares, so collect_results can honour multiple_results instead of
+        # relying purely on conventional paths. Self-managed launchers commonly
+        # drop their CSV next to themselves, which is the one location the
+        # conventional candidate list cannot guess.
+        self._slurm_multi_script_dir = model_script_path.parent
+        self._slurm_multi_results_name = model_info.get("multiple_results") or ""
+
         script_content = "\n".join(script_lines)
         
         # Save script
         self.script_path = self.output_dir / f"madengine_{model_info['name']}.sh"
-        self.script_path.write_text(script_content)
+        self.script_path.write_text(script_content, encoding="utf-8")
         self.script_path.chmod(0o755)
         
         self.console.print(f"[green]✓ Generated slurm_multi script: {self.script_path}[/green]")
@@ -1416,7 +1449,7 @@ export MASTER_PORT={master_port}
             
             # Read new content from file
             try:
-                with open(output_file, 'r') as f:
+                with open(output_file, 'r', encoding="utf-8", errors="ignore") as f:
                     # Seek to last position
                     last_pos = self._output_positions.get(job_id, 0)
                     f.seek(last_pos)
@@ -1471,7 +1504,7 @@ export MASTER_PORT={master_port}
                         if os.path.exists(err_file) and os.path.getsize(err_file) > 0:
                             self.console.print(f"\n[yellow]Last 10 lines of error log:[/yellow]")
                             try:
-                                with open(err_file, 'r') as f:
+                                with open(err_file, 'r', encoding="utf-8", errors="ignore") as f:
                                     lines = f.readlines()
                                     for line in lines[-10:]:
                                         if line.strip():
@@ -1829,7 +1862,7 @@ export MASTER_PORT={master_port}
             node_subdir = job_dir / f"node_{idx}"
             node_subdir.mkdir(parents=True, exist_ok=True)
             if not (node_subdir / "stdout.out").exists():
-                (node_subdir / "stdout.out").write_text(content)
+                (node_subdir / "stdout.out").write_text(content, encoding="utf-8")
 
         # Parse performance from each node's log
         all_parsed: List[Dict[str, Any]] = []
@@ -2022,7 +2055,7 @@ export MASTER_PORT={master_port}
 
         if run_details_dict is not None:
             perf_entry_path = Path("perf_entry.json")
-            with open(perf_entry_path, "w") as f:
+            with open(perf_entry_path, "w", encoding="utf-8") as f:
                 json.dump(run_details_dict, f, indent=2)
             perf_csv_path = "perf.csv"
             self._ensure_perf_csv_exists()
@@ -2122,6 +2155,19 @@ export MASTER_PORT={master_port}
             if candidates:
                 perf_csv_path = candidates[0]
 
+        # Honour the model card's declared multiple_results filename, resolved
+        # next to the launcher script. Checked after an explicit results_dir so
+        # that config still overrides the model card, but before the
+        # conventional paths, which are guesses by comparison.
+        if not perf_csv_path and getattr(self, "_slurm_multi_results_name", ""):
+            declared = Path(self._slurm_multi_results_name)
+            if not declared.is_absolute():
+                declared = (
+                    getattr(self, "_slurm_multi_script_dir", Path(".")) / declared
+                )
+            if declared.exists() and declared.stat().st_size > 0:
+                perf_csv_path = declared
+
         if not perf_csv_path:
             user = os.environ.get("USER", "")
             shared_candidates = []
@@ -2166,7 +2212,8 @@ export MASTER_PORT={master_port}
             cwd_perf = Path("perf.csv")
             try:
                 if cwd_perf.exists():
-                    with open(perf_csv_path, "r") as src, open(cwd_perf, "a") as dst:
+                    with open(perf_csv_path, "r", encoding="utf-8", errors="ignore") as src, \
+                            open(cwd_perf, "a", encoding="utf-8") as dst:
                         next(src, None)  # skip per-job header so cwd CSV stays single-headed
                         for line in src:
                             dst.write(line)
@@ -2200,7 +2247,7 @@ export MASTER_PORT={master_port}
 
         perf_file = Path(results["perf_files"][0])
         try:
-            with open(perf_file, "r") as f:
+            with open(perf_file, "r", encoding="utf-8", errors="ignore") as f:
                 reader = csv.DictReader(f)
                 reader.fieldnames = [f.strip() for f in (reader.fieldnames or [])]
                 rows = [{k.strip(): v for k, v in row.items() if k} for row in reader]

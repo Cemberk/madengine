@@ -595,3 +595,154 @@ class TestSglangDisaggDefaultSplit:
             deployment_factory._generate_sglang_disagg_command(
                 nnodes=1, nproc_per_node=8, master_port=12345
             )
+
+
+# ---------------------------------------------------------------------------
+# 6. Allocation sizing, accounting directives, and declared results filename
+
+def _make_slurm_multi_deployment(
+    tmp_path: Path,
+    slurm_cfg: dict,
+    distributed_cfg: dict,
+    extra_model_fields: dict = None,
+) -> SlurmDeployment:
+    """Build a minimal slurm_multi SlurmDeployment rooted at tmp_path."""
+    script_rel = "scripts/launcher/run.slurm"
+    script_abs = tmp_path / script_rel
+    script_abs.parent.mkdir(parents=True, exist_ok=True)
+    script_abs.write_text("#!/bin/bash\n# placeholder\n")
+
+    image_key = "example/image:tag"
+    model_entry = {
+        "name": "unit_slurm_multi_model",
+        "scripts": script_rel,
+        "args": "",
+        "env_vars": {"DOCKER_IMAGE_NAME": image_key},
+        "distributed": distributed_cfg,
+        "slurm": slurm_cfg,
+    }
+    model_entry.update(extra_model_fields or {})
+
+    manifest = {
+        "built_images": {image_key: {"image_name": image_key, "docker_image": image_key}},
+        "built_models": {image_key: model_entry},
+        "context": {"gpu_vendor": "AMD", "guest_os": "UBUNTU"},
+    }
+    manifest_path = tmp_path / "build_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    cfg = DeploymentConfig(
+        target="slurm",
+        manifest_file=str(manifest_path),
+        additional_context={
+            "deploy": "slurm",
+            "gpu_vendor": "AMD",
+            "guest_os": "UBUNTU",
+            "slurm": dict(slurm_cfg, output_dir=str(tmp_path / "slurm_results")),
+            "distributed": distributed_cfg,
+        },
+    )
+    return SlurmDeployment(cfg)
+
+
+class TestAllocationSizedFromNnodes:
+    """slurm.nodes sizes the job; a larger distributed.nnodes must grow it."""
+
+    def test_nnodes_grows_a_defaulted_node_count(self, tmp_path):
+        """A model card with only distributed.nnodes must not submit a 1-node job."""
+        d = _make_slurm_multi_deployment(
+            tmp_path,
+            slurm_cfg={"partition": "gpu", "time": "24:00:00"},
+            distributed_cfg={"launcher": "slurm_multi", "nnodes": 4},
+        )
+        assert d.nodes == 4
+        assert d.prepare() is True
+        script = Path(d.script_path).read_text()
+        assert "#SBATCH --nodes=4" in script
+        assert "#SBATCH --ntasks=4" in script
+
+    def test_explicit_larger_nodes_is_not_shrunk(self, tmp_path):
+        """An explicit slurm.nodes above nnodes stays put."""
+        d = _make_slurm_multi_deployment(
+            tmp_path,
+            slurm_cfg={"partition": "gpu", "nodes": 6, "time": "24:00:00"},
+            distributed_cfg={"launcher": "slurm_multi", "nnodes": 4},
+        )
+        assert d.nodes == 6
+
+    def test_missing_nnodes_leaves_nodes_alone(self, tmp_path):
+        """No distributed.nnodes means no adjustment."""
+        d = _make_slurm_multi_deployment(
+            tmp_path,
+            slurm_cfg={"partition": "gpu", "nodes": 2, "time": "24:00:00"},
+            distributed_cfg={"launcher": "slurm_multi"},
+        )
+        assert d.nodes == 2
+
+
+class TestSlurmMultiAccountingDirectives:
+    """account/qos must reach the hand-built slurm_multi header, as they do job.sh.j2."""
+
+    def test_account_and_qos_are_emitted(self, tmp_path):
+        d = _make_slurm_multi_deployment(
+            tmp_path,
+            slurm_cfg={"partition": "gpu", "nodes": 2, "account": "proj123", "qos": "high"},
+            distributed_cfg={"launcher": "slurm_multi", "nnodes": 2},
+        )
+        assert d.prepare() is True
+        script = Path(d.script_path).read_text()
+        assert "#SBATCH --account=proj123" in script
+        assert "#SBATCH --qos=high" in script
+
+    def test_absent_when_unset(self, tmp_path):
+        d = _make_slurm_multi_deployment(
+            tmp_path,
+            slurm_cfg={"partition": "gpu", "nodes": 2},
+            distributed_cfg={"launcher": "slurm_multi", "nnodes": 2},
+        )
+        assert d.prepare() is True
+        script = Path(d.script_path).read_text()
+        assert "--account=" not in script
+        assert "--qos=" not in script
+
+
+class TestSlurmMultiDeclaredResultsFile:
+    """multiple_results is resolved next to the launcher, below an explicit results_dir."""
+
+    def test_declared_name_resolved_beside_launcher(self, tmp_path, monkeypatch):
+        d = _make_slurm_multi_deployment(
+            tmp_path,
+            slurm_cfg={"partition": "gpu", "nodes": 2},
+            distributed_cfg={"launcher": "slurm_multi", "nnodes": 2},
+            extra_model_fields={"multiple_results": "perf_MyModel.csv"},
+        )
+        assert d.prepare() is True
+        declared = tmp_path / "scripts" / "launcher" / "perf_MyModel.csv"
+        declared.write_text("model,performance\nfoo,1.0\n")
+
+        monkeypatch.chdir(tmp_path)  # the collector aggregates into <cwd>/perf.csv
+        monkeypatch.setattr(d, "_collect_results_parse_perf_csv", lambda *a, **k: None)
+        results = {"successful_runs": [], "failed_runs": [], "perf_files": [], "logs": []}
+        d._collect_slurm_multi_results("12345", results, None)
+        assert results["perf_files"] == [str(declared)]
+
+    def test_results_dir_still_wins(self, tmp_path, monkeypatch):
+        results_dir = tmp_path / "explicit_results"
+        results_dir.mkdir()
+        override = results_dir / "perf.csv"
+        override.write_text("model,performance\nbar,2.0\n")
+
+        d = _make_slurm_multi_deployment(
+            tmp_path,
+            slurm_cfg={"partition": "gpu", "nodes": 2, "results_dir": str(results_dir)},
+            distributed_cfg={"launcher": "slurm_multi", "nnodes": 2},
+            extra_model_fields={"multiple_results": "perf_MyModel.csv"},
+        )
+        assert d.prepare() is True
+        (tmp_path / "scripts" / "launcher" / "perf_MyModel.csv").write_text("model,performance\nfoo,1.0\n")
+
+        monkeypatch.chdir(tmp_path)  # the collector aggregates into <cwd>/perf.csv
+        monkeypatch.setattr(d, "_collect_results_parse_perf_csv", lambda *a, **k: None)
+        results = {"successful_runs": [], "failed_runs": [], "perf_files": [], "logs": []}
+        d._collect_slurm_multi_results("12345", results, None)
+        assert results["perf_files"] == [str(override)]

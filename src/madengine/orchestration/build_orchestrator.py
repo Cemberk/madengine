@@ -1169,7 +1169,7 @@ exit 0
 """
         
         build_script_path = Path("madengine_build_job.sh")
-        build_script_path.write_text(build_script_content)
+        build_script_path.write_text(build_script_content, encoding="utf-8")
         build_script_path.chmod(0o755)
         
         if inside_allocation:
