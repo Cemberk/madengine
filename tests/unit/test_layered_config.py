@@ -322,3 +322,43 @@ class TestDockerEnvVarsReachSlurm:
             {"env_vars": {"NCCL_IB_GID_INDEX": "2"}},
         )
         assert env["NCCL_IB_GID_INDEX"] == "3"
+
+
+class TestToolsOnSelfManagedPath:
+    """slurm_multi used to drop `tools` entirely.
+
+    prepare() early-dispatches self-managed launchers and returns, so the
+    templated path's profiling block never ran for them. madengine cannot wrap a
+    script it does not control, but silently ignoring a configured tool is worse
+    than saying so.
+    """
+
+    @staticmethod
+    def _resolve(tools, enabled, resolved):
+        """The decision _build_env_vars now makes, isolated from SLURM."""
+        env = {}
+        if tools:
+            picked = resolved if enabled else []
+            if picked:
+                env["MAD_TOOLS"] = ",".join(
+                    t.get("name", str(t)) if isinstance(t, dict) else str(t)
+                    for t in picked
+                )
+        return env
+
+    def test_no_tools_configured_adds_nothing(self):
+        assert self._resolve([], True, []) == {}
+
+    def test_resolved_tools_reach_the_script(self):
+        env = self._resolve([{"name": "rocprofv3"}], True, [{"name": "rocprofv3"}])
+        assert env["MAD_TOOLS"] == "rocprofv3"
+
+    def test_plain_string_tools_are_handled(self):
+        assert (
+            self._resolve(["rocprofv3"], True, ["rocprofv3"])["MAD_TOOLS"]
+            == "rocprofv3"
+        )
+
+    def test_profiling_unavailable_sets_nothing(self):
+        # rocprofv3 missing -> no MAD_TOOLS, and the caller warns.
+        assert self._resolve([{"name": "rocprofv3"}], False, []) == {}

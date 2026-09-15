@@ -470,6 +470,52 @@ class SlurmDeployment(BaseDeployment):
         if "env_vars" in self.config.additional_context:
             env_vars.update(self.config.additional_context["env_vars"])
         
+        # Tools (profiling) on the self-managed path.
+        #
+        # prepare() early-dispatches slurm_multi here and returns, so the
+        # templated path's profiling block never runs for these models and a
+        # configured `tools` was silently ignored. madengine cannot wrap a script
+        # it does not control -- that is what self-managed means -- but it can run
+        # the SAME rocprofv3 detection and hand the decision to the script instead
+        # of dropping it. A script that reads MAD_TOOLS profiles; one that does not
+        # is no worse off than before, and either way the log says what happened.
+        _tools = self.config.additional_context.get("tools", []) or []
+        if _tools:
+            class _ConsoleLogger:
+                def __init__(self, console):
+                    self.console = console
+
+                def info(self, msg):
+                    self.console.print(f"[cyan]{msg}[/cyan]")
+
+                def warning(self, msg):
+                    self.console.print(f"[yellow]{msg}[/yellow]")
+
+                def debug(self, msg):
+                    pass
+
+            _profiling = configure_multi_node_profiling(
+                nnodes=self.nodes,
+                tools_config=_tools,
+                logger=_ConsoleLogger(self.console),
+            )
+            _resolved = _profiling["tools"] if _profiling["enabled"] else []
+            if _resolved:
+                _names = ",".join(
+                    t.get("name", str(t)) if isinstance(t, dict) else str(t)
+                    for t in _resolved
+                )
+                env_vars.setdefault("MAD_TOOLS", _names)
+                self.console.print(
+                    f"[green]✓ Tools available to the model script via "
+                    f"MAD_TOOLS={_names}[/green]"
+                )
+            else:
+                self.console.print(
+                    "[yellow]⚠ tools were configured but rocprofv3 is not "
+                    "available; running without profiling[/yellow]"
+                )
+
         # From distributed config (model's distributed section)
         model_distributed = model_info.get("distributed", {})
         sglang_disagg_config = model_distributed.get("sglang_disagg", {}) or self.distributed_config.get("sglang_disagg", {})
