@@ -157,6 +157,56 @@ run that way should use ways 1–3.
 
 ---
 
+## The adapter contract
+
+madengine and a workload script speak different vocabularies. A templated
+launcher exports madengine's names; the proven launchers read their own. Some
+workload has to translate, and today each one hand-rolls its own shim --
+`scripts/sglang_disagg/run.sh` on the mad-rccl branch is one.
+
+What a templated launcher exports, and what the disagg launchers read:
+
+| madengine exports | workload reads | meaning |
+|---|---|---|
+| `SGLANG_NODE_RANK` | `NODE_RANK` | this node's global 0-based rank |
+| `SGLANG_DISAGG_PREFILL_NODES` | `xP` | prefill node count |
+| `SGLANG_DISAGG_DECODE_NODES` | `yD` | decode node count |
+| `SGLANG_NODE_IPS` | `IPADDRS` | rank-ordered node IPs, comma separated |
+| `SGLANG_TP_SIZE` | `TP_SIZE` | tensor-parallel degree |
+| `MASTER_PORT` | `MASTER_PORT` | already shared |
+
+Two rules make an adapter safe:
+
+**Environment wins.** Read every value as `${VAR:-<fallback>}` so a submit-time
+`-e` or a card's `env_vars` overrides the launcher. This is the same rule
+`cluster.sh` and the `mad.env` templates already follow, and it is what lets one
+card run under either path.
+
+**Do not require the adapter for topology.** The self-managed path now exports
+`MAD_NODE_IPS`, `IPADDRS`, `SGLANG_NODE_IPS` and `MAD_NODE_RANK` directly from
+the allocation, so a script does not have to rediscover them. Before that, the
+only way to get the rank-ordered IP list was to rebuild it in-container --
+`scripts/sglang_disagg/ip_rendezvous.py` does exactly that, with a stdlib TCP
+rendezvous and a 1800s budget. That is now a fallback for what the scheduler
+cannot answer, not the normal path.
+
+### Where a value has to cross three boundaries
+
+A manifest-driven run passes through three places, and a value has to survive
+all of them to reach the workload:
+
+| declared in | crosses | reaches |
+|---|---|---|
+| `deployment_config.env_vars` | sbatch | the SLURM job |
+| `context.docker_env_vars` | `docker run -e` | the container |
+| `mad.env` | the shell | the submitting process |
+
+These used to require declaring the same variable in more than one of them.
+`context.docker_env_vars` is now also applied on the SLURM path, so one
+declaration is enough. That matters because a variable written twice drifts, and
+a wrong NIC list does not fail: RCCL initialises zero NICs, falls back to TCP,
+and the run still reports a number measured over the wrong transport.
+
 ## Choosing
 
 - **Tuning a model's serve recipe** → way 1 (`models.yaml`); it owns the role × mode axis.
