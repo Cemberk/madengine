@@ -620,6 +620,28 @@ class SlurmDeployment(BaseDeployment):
             script_lines.append(f"export {key}={shlex.quote(str(value))}")
         
         script_lines.append("")
+        # Rank-ordered node IPs, computed the same way the sglang-disagg launcher
+        # computes them (_generate_sglang_disagg_command). A self-managed script
+        # needs this to address its peers, and madengine was the only thing that
+        # knew the allocation -- so every such workload has had to rediscover it.
+        # scripts/sglang_disagg/ip_rendezvous.py exists precisely for this: it
+        # rebuilds the list with a stdlib TCP rendezvous because "madengine
+        # forwards MASTER_ADDR/NODE_RANK/NNODES into each container but NOT the
+        # rank-ordered node IP list".
+        #
+        # Exported without overwriting: a script that already sets IPADDRS, or a
+        # card that pins it, keeps its own value.
+        script_lines.extend([
+            "# Rank-ordered node IPs for the allocation (see MAD_NODE_IPS/IPADDRS).",
+            "MAD_NODE_IPS=$(scontrol show hostname \"$SLURM_JOB_NODELIST\" 2>/dev/null | while read -r _n; do",
+            "    getent hosts \"$_n\" | awk '{print $1}' | head -1",
+            "done | tr '\\n' ',' | sed 's/,$//')",
+            "export MAD_NODE_IPS",
+            "export IPADDRS=\"${IPADDRS:-$MAD_NODE_IPS}\"",
+            "export SGLANG_NODE_IPS=\"${SGLANG_NODE_IPS:-$MAD_NODE_IPS}\"",
+            "export MAD_NODE_RANK=\"${MAD_NODE_RANK:-${SLURM_PROCID:-0}}\"",
+            "",
+        ])
         script_lines.extend([
             "echo '=========================================='",
             "echo 'slurm_multi Launcher'",
@@ -629,6 +651,7 @@ class SlurmDeployment(BaseDeployment):
             "echo 'SLURM_JOB_ID:' $SLURM_JOB_ID",
             "echo 'SLURM_NNODES:' $SLURM_NNODES",
             "echo 'SLURM_NODELIST:' $SLURM_NODELIST",
+            "echo 'Node IPs:' $MAD_NODE_IPS",
             "echo ''",
         ])
         
