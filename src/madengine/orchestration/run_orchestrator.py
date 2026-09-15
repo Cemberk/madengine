@@ -599,6 +599,19 @@ class RunOrchestrator:
                     if k not in self.context.ctx["docker_env_vars"]:
                         self.context.ctx["docker_env_vars"][k] = v
 
+            # Also hand docker_env_vars to the deployment layer, which receives
+            # only additional_context. Without this a manifest's docker_env_vars
+            # reaches a local `docker run -e` but is silently dropped on the SLURM
+            # path, so the same variable has had to be declared twice -- once in
+            # context.docker_env_vars and again in deployment_config.env_vars.
+            # Two copies of a NIC list drift, and a wrong one does not fail: RCCL
+            # falls back to TCP and the benchmark still reports a number.
+            # setdefault, so an explicit runtime value still wins.
+            if self.context.ctx.get("docker_env_vars"):
+                self.additional_context.setdefault(
+                    "docker_env_vars", self.context.ctx["docker_env_vars"]
+                )
+
         # Merge runtime additional_context (takes precedence over manifest)
         # This allows users to override tools/scripts at runtime
         if self.additional_context:

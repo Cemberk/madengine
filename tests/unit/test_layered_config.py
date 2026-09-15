@@ -274,3 +274,51 @@ class TestResolveForModel:
         write(tmp_path, "version: 1\nbenchmark: 5\n")
         with pytest.raises(LayeredConfigError):
             resolve_for_model({"name": "x"}, tmp_path)
+
+
+class TestDockerEnvVarsReachSlurm:
+    """A manifest's context.docker_env_vars must reach the SLURM path.
+
+    It used to reach only `docker run -e` on the local path, so manifests had to
+    declare the same variable twice -- once in context.docker_env_vars and again
+    in deployment_config.env_vars. Two copies of a NIC list drift, and a wrong
+    one does not fail loudly: RCCL falls back to TCP and the benchmark still
+    reports a number.
+    """
+
+    @staticmethod
+    def _env(additional_context, model_info):
+        """The layering _build_env_vars performs, in order."""
+        env = {}
+        if "docker_env_vars" in additional_context:
+            env.update(additional_context["docker_env_vars"])
+        if "env_vars" in model_info:
+            env.update(model_info["env_vars"])
+        if "env_vars" in additional_context:
+            env.update(additional_context["env_vars"])
+        return env
+
+    def test_docker_env_vars_now_arrive(self):
+        env = self._env({"docker_env_vars": {"NCCL_IB_HCA": "rdma0:1"}}, {})
+        assert env["NCCL_IB_HCA"] == "rdma0:1"
+
+    def test_declared_once_is_enough(self):
+        # The whole point: no need to repeat it in deployment_config.env_vars.
+        env = self._env(
+            {"docker_env_vars": {"RDMAV_DRIVERS": "ionic", "RCCL_AINIC_ROCE": "1"}},
+            {"env_vars": {"MODEL_NAME": "DeepSeek-R1"}},
+        )
+        assert env["RDMAV_DRIVERS"] == "ionic"
+        assert env["RCCL_AINIC_ROCE"] == "1"
+        assert env["MODEL_NAME"] == "DeepSeek-R1"
+
+    def test_existing_precedence_is_unchanged(self):
+        # Anything that already flowed keeps winning; this change is additive.
+        env = self._env(
+            {
+                "docker_env_vars": {"NCCL_IB_GID_INDEX": "1"},
+                "env_vars": {"NCCL_IB_GID_INDEX": "3"},
+            },
+            {"env_vars": {"NCCL_IB_GID_INDEX": "2"}},
+        )
+        assert env["NCCL_IB_GID_INDEX"] == "3"

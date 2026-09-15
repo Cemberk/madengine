@@ -454,6 +454,14 @@ class SlurmDeployment(BaseDeployment):
             )
             env_vars.update(layered_env)
 
+        # From the manifest's context.docker_env_vars. Placed below the card and
+        # the deployment_config so nothing that already flows changes precedence:
+        # the only effect is that values which used to be dropped on this path now
+        # arrive. This is what lets a manifest declare a variable once instead of
+        # once here and again in deployment_config.env_vars.
+        if "docker_env_vars" in self.config.additional_context:
+            env_vars.update(self.config.additional_context["docker_env_vars"])
+
         # From model_info.env_vars
         if "env_vars" in model_info:
             env_vars.update(model_info["env_vars"])
