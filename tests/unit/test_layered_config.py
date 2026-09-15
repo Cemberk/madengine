@@ -362,3 +362,38 @@ class TestToolsOnSelfManagedPath:
     def test_profiling_unavailable_sets_nothing(self):
         # rocprofv3 missing -> no MAD_TOOLS, and the caller warns.
         assert self._resolve([{"name": "rocprofv3"}], False, []) == {}
+
+
+class TestSelfManagedResultsHonourTheCard:
+    """The self-managed path ignored the card's declared multiple_results.
+
+    The templated path reads it and scores candidates; this one searched a
+    hardcoded list naming /shared_inference -- one site's NFS mount. On any other
+    cluster the card's declaration was the only thing that could have worked.
+    """
+
+    @staticmethod
+    def _declared(manifest):
+        for m in (manifest.get("built_models") or {}).values():
+            if m.get("multiple_results"):
+                return m["multiple_results"]
+        return None
+
+    def test_declaration_is_found(self):
+        manifest = {"built_models": {"img": {"multiple_results": "perf_Kimi-K3.csv"}}}
+        assert self._declared(manifest) == "perf_Kimi-K3.csv"
+
+    def test_absent_declaration_falls_back(self):
+        assert self._declared({"built_models": {"img": {}}}) is None
+
+    def test_empty_manifest_is_safe(self):
+        assert self._declared({}) is None
+
+    def test_first_declaring_model_wins(self):
+        manifest = {
+            "built_models": {
+                "a": {},
+                "b": {"multiple_results": "perf_b.csv"},
+            }
+        }
+        assert self._declared(manifest) == "perf_b.csv"

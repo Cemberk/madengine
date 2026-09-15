@@ -2251,7 +2251,40 @@ export MASTER_PORT={master_port}
         # Priority: results_dir config > shared_inference NFS > slurm_output/perf_csv
         # > <cwd>/perf.csv (with NFS-propagation retry).
         perf_csv_path = None
-        if self.slurm_config.get("results_dir"):
+
+        # What the CARD declares, before any guessing. The templated path reads
+        # multiple_results and picks the best candidate with
+        # _select_best_multiple_results_csv; this path did neither, so a
+        # self-managed card that says where its results are was not believed and
+        # the hardcoded list below was searched instead. That list names
+        # /shared_inference, which is one site's NFS mount -- on any other cluster
+        # the declaration was the only thing that could have worked.
+        #
+        # Scoring matters as much as finding: _select_best_multiple_results_csv
+        # ranks candidates by non-empty performance rows, so a header-only CSV
+        # left by a failed run loses to a real one instead of being published as
+        # a green result with no numbers.
+        _mr = None
+        for _m in (self.manifest.get("built_models") or {}).values():
+            if _m.get("multiple_results"):
+                _mr = _m["multiple_results"]
+                break
+        if _mr:
+            _declared = [
+                c for c in (
+                    list(Path.cwd().rglob(_mr))
+                    + list(self.output_dir.rglob(_mr))
+                ) if c.is_file()
+            ]
+            if _declared:
+                perf_csv_path = self._select_best_multiple_results_csv(_declared)
+                if perf_csv_path:
+                    self.console.print(
+                        f"[green]✓ Using the card's declared multiple_results "
+                        f"'{_mr}': {perf_csv_path}[/green]"
+                    )
+
+        if perf_csv_path is None and self.slurm_config.get("results_dir"):
             results_dir = Path(self.slurm_config["results_dir"])
             candidates = list(results_dir.glob("perf*.csv"))
             if candidates:
