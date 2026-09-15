@@ -32,6 +32,10 @@ from .slurm_node_selector import SlurmNodeSelector
 from madengine.core.errors import ConfigurationError
 from madengine.core.image_digest import resolve_pinned_image
 from madengine.core.timeout import subprocess_timeout
+from madengine.deployment.layered_config import (
+    LayeredConfigError,
+    resolve_for_model,
+)
 from madengine.utils.gpu_config import resolve_runtime_gpus
 from madengine.utils.run_details import get_build_number, get_pipeline
 from madengine.utils.path_utils import scripts_base_dir_from
@@ -427,7 +431,29 @@ class SlurmDeployment(BaseDeployment):
         
         # Get environment variables
         env_vars = {}
-        
+
+        # Layered config (the fourth way), when this card has one. Seeded FIRST so
+        # the card's own env_vars and any submit-time override below still win.
+        # Cards using models.yaml / configs/*.yaml / cluster.sh are unaffected:
+        # resolve_for_model returns an empty env when there is no such file, and
+        # madengine never parses those three formats. See docs/distributed-config.md.
+        try:
+            layered_env, layered_warnings = resolve_for_model(
+                model_info,
+                model_script_path.parent,
+                runtime_env=self.config.additional_context.get("env_vars"),
+            )
+        except LayeredConfigError as exc:
+            self.console.print(f"[red]✗ {exc}[/red]")
+            return False
+        for warning in layered_warnings:
+            self.console.print(f"[yellow]⚠ {warning}[/yellow]")
+        if layered_env:
+            self.console.print(
+                f"[green]✓ Layered config resolved {len(layered_env)} env var(s)[/green]"
+            )
+            env_vars.update(layered_env)
+
         # From model_info.env_vars
         if "env_vars" in model_info:
             env_vars.update(model_info["env_vars"])
