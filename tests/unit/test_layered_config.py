@@ -397,3 +397,125 @@ class TestSelfManagedResultsHonourTheCard:
             }
         }
         assert self._declared(manifest) == "perf_b.csv"
+
+
+class TestEachWayStandsAlone:
+    """Any ONE configuration source is enough; none of them is required.
+
+    The four ways are alternatives, not a stack that has to be assembled. A team
+    that has only cluster.sh, or only a models.yaml, or only a way-4 file, must
+    get a working run -- and a team that has none of them must too, because ways
+    1-3 are read inside the container by scripts madengine never parses.
+
+    These assert the absence half of that: nothing madengine adds on its own may
+    become a thing that has to exist.
+    """
+
+    def test_no_way4_file_resolves_to_empty_not_error(self, tmp_path):
+        env, warnings = resolve_for_model({"name": "m"}, tmp_path)
+        assert env == {}
+        assert warnings == []
+
+    def test_no_scripts_dir_at_all(self):
+        env, _ = resolve_for_model({"name": "m"}, None)
+        assert env == {}
+
+    def test_way4_alone_needs_no_card_env(self, tmp_path):
+        (tmp_path / "mad-config.yaml").write_text(
+            "version: 1\nsite:\n  env:\n    NVME_ROOT: /mnt/nvme\n"
+        )
+        env, _ = resolve_for_model({"name": "m"}, tmp_path)
+        assert env == {"NVME_ROOT": "/mnt/nvme"}
+
+    def test_card_env_alone_needs_no_way4_file(self, tmp_path):
+        card = {"name": "m", "env_vars": {"TP_SIZE": "8"}}
+        env, _ = resolve_for_model(card, tmp_path)
+        # No file: way 4 contributes nothing and the card is untouched.
+        assert env == {}
+
+    def test_missing_mad_config_pointer_is_not_fatal(self, tmp_path):
+        card = {"name": "m", "env_vars": {"MAD_CONFIG": "nope.yaml"}}
+        env, _ = resolve_for_model(card, tmp_path)
+        assert env == {}
+
+
+class TestOptionalDiagnosticsStayOptional:
+    """A missing optional input must not end the run.
+
+    gather_system_env_details is called on a default, not on a card's request, and
+    it names its script by a CWD-relative path. When the model repo carries no
+    copy the `cp` inside the container failed and killed a two-node job ten
+    minutes in. Absence has to be a skip.
+    """
+
+    @staticmethod
+    def _runner():
+        from madengine.execution.container_runner import ContainerRunner
+
+        return ContainerRunner.__new__(ContainerRunner)
+
+    def test_existing_copy_is_used_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        rel = "scripts/common/pre_scripts/run_rocenv_tool.sh"
+        (tmp_path / "scripts/common/pre_scripts").mkdir(parents=True)
+        (tmp_path / rel).write_text("# the repo's own copy\n")
+        assert self._runner()._ensure_rocenv_script(rel) is True
+        assert (tmp_path / rel).read_text() == "# the repo's own copy\n"
+
+    def test_packaged_copy_is_staged_when_repo_has_none(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        rel = "scripts/common/pre_scripts/run_rocenv_tool.sh"
+        assert not (tmp_path / rel).exists()
+        assert self._runner()._ensure_rocenv_script(rel) is True
+        assert (tmp_path / rel).is_file()
+
+    def test_staging_brings_the_rocenvtool_dependency(self, tmp_path, monkeypatch):
+        """run_rocenv_tool.sh is not self-contained.
+
+        It runs rocEnvTool/rocenv_tool.py, taken from beside itself or from
+        ../scripts/common/pre_scripts. Staging only the .sh would satisfy the cp
+        and then fail inside the container, which is a worse failure than the one
+        being fixed: later, and further from the cause.
+        """
+        monkeypatch.chdir(tmp_path)
+        rel = "scripts/common/pre_scripts/run_rocenv_tool.sh"
+        assert self._runner()._ensure_rocenv_script(rel) is True
+        deps = tmp_path / "scripts/common/pre_scripts/rocEnvTool"
+        assert deps.is_dir()
+        assert list(deps.glob("*.py")), "rocEnvTool staged without its python files"
+
+    def test_partial_stage_is_completed_not_skipped(self, tmp_path, monkeypatch):
+        """A tree carrying the .sh but not rocEnvTool/ still has to be repaired."""
+        monkeypatch.chdir(tmp_path)
+        rel = "scripts/common/pre_scripts/run_rocenv_tool.sh"
+        (tmp_path / "scripts/common/pre_scripts").mkdir(parents=True)
+        (tmp_path / rel).write_text("# repo copy, no rocEnvTool beside it\n")
+        assert self._runner()._ensure_rocenv_script(rel) is True
+        assert (tmp_path / "scripts/common/pre_scripts/rocEnvTool").is_dir()
+        # The repo's own script is authoritative and must not be overwritten.
+        assert (tmp_path / rel).read_text().startswith("# repo copy")
+
+    def test_absent_everywhere_skips_instead_of_raising(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        rel = "scripts/common/pre_scripts/does_not_exist.sh"
+        assert self._runner()._ensure_rocenv_script(rel) is False
+
+    def test_unwritable_cwd_skips_instead_of_raising(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        rel = "scripts/common/pre_scripts/run_rocenv_tool.sh"
+        monkeypatch.setattr(
+            "madengine.execution.container_runner.os.makedirs",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("read-only file system")),
+        )
+        assert self._runner()._ensure_rocenv_script(rel) is False
+
+    def test_skip_means_no_pre_script_is_appended(self, tmp_path, monkeypatch):
+        """The whole point: a skip must leave pre_scripts empty, not half-built."""
+        monkeypatch.chdir(tmp_path)
+        runner = self._runner()
+        monkeypatch.setattr(
+            type(runner), "_ensure_rocenv_script", lambda self, rel: False
+        )
+        scripts = {"pre_scripts": []}
+        runner.gather_system_env_details(scripts, "some-model")
+        assert scripts["pre_scripts"] == []
