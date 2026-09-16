@@ -23,6 +23,31 @@ Whatever you use, it ends up as **environment variables** reaching the workload,
 because that is the only thing that survives both the container boundary and the
 choice of launcher.
 
+## Any one of them is enough
+
+The four ways are **alternatives, not a stack**. They do not have to be active at
+the same time, and none of them is required:
+
+- a team with only a `cluster.sh` gets a working run;
+- a team with only a `models.yaml` gets a working run;
+- a team with only a `mad-config.yaml` gets a working run;
+- a team with none of them gets a working run, because ways 1–3 are read inside
+  the container by scripts madengine never parses.
+
+This is a rule about madengine, not about the formats: **nothing madengine adds on
+its own may become something that has to exist.** An optional input that is absent
+is skipped with a line saying so — never a failure.
+
+It is worth stating because it was once violated in the one place hardest to see.
+`gather_system_env_details` appended a diagnostic script nobody had asked for,
+named by a path relative to the working directory. When a model repo carried no
+copy, the `cp` failed and ended the run — after the image was built and the
+container was up, ten minutes into a two-node job. The fix was not to make the
+file mandatory but to make its absence survivable.
+
+`tests/unit/test_layered_config.py` asserts both halves: each way resolving alone,
+and each optional input missing without consequence.
+
 ---
 
 ## Ways 1–3: what madengine does
