@@ -519,3 +519,67 @@ class TestOptionalDiagnosticsStayOptional:
         scripts = {"pre_scripts": []}
         runner.gather_system_env_details(scripts, "some-model")
         assert scripts["pre_scripts"] == []
+
+
+class TestNamespacedModelNamesReachDisk:
+    """A card's name is routinely namespaced; a filename is one segment.
+
+    Discovery names a card found in a nested models.json after its directory, so
+    `vllm_multinode/pyt_vllm_kimi-k3_mi300x_pp2xtp8` is the normal shape for MAD.
+    Interpolated into a filename, that slash is a directory separator and the
+    write fails on a parent nobody created. Builds 62 and 63 both died this way,
+    on stock madengine as well as this branch.
+    """
+
+    @staticmethod
+    def _dep():
+        from madengine.deployment.slurm import SlurmDeployment
+
+        return SlurmDeployment.__new__(SlurmDeployment)
+
+    def test_namespaced_name_becomes_one_segment(self):
+        got = self._dep()._safe_name(
+            {"name": "vllm_multinode/pyt_vllm_kimi-k3_mi300x_pp2xtp8"}
+        )
+        assert "/" not in got
+        assert got == "vllm_multinode_pyt_vllm_kimi-k3_mi300x_pp2xtp8"
+
+    def test_flat_name_is_untouched(self):
+        """The RCCL team's cards are flat and must keep the filenames they have."""
+        name = "primus_pyt_megatron_lm_train_llama-3.1-70b"
+        assert self._dep()._safe_name({"name": name}) == name
+
+    def test_every_segment_of_a_deep_name_is_flattened(self):
+        got = self._dep()._safe_name({"name": "a/b/c"})
+        assert got == "a_b_c"
+
+    def test_missing_name_does_not_raise(self):
+        assert self._dep()._safe_name({}) == "model"
+
+    def test_the_path_that_failed_in_build_62_now_resolves(self, tmp_path):
+        """The exact ENOENT: writing under a parent that was never created."""
+        dep = self._dep()
+        model = {"name": "vllm_multinode/pyt_vllm_kimi-k3_mi300x_pp2xtp8"}
+        out = tmp_path / "slurm_results"
+        out.mkdir()
+
+        naive = out / f"madengine_{model['name']}.sh"
+        with pytest.raises(FileNotFoundError):
+            naive.write_text("#!/bin/bash\n")
+
+        safe = out / f"madengine_{dep._safe_name(model)}.sh"
+        safe.write_text("#!/bin/bash\n")
+        assert safe.is_file()
+        assert safe.parent == out
+
+    def test_no_raw_interpolation_of_a_name_into_a_filename_remains(self):
+        """Guards the other four sites, which no unit test would otherwise reach."""
+        import inspect
+
+        from madengine.deployment import slurm as slurm_mod
+
+        src = inspect.getsource(slurm_mod)
+        assert "madengine_{model_info['name']}" not in src, (
+            "a filename is being built from an unsanitised model name; "
+            "use self._safe_name(model_info)"
+        )
