@@ -583,3 +583,59 @@ class TestNamespacedModelNamesReachDisk:
             "a filename is being built from an unsanitised model name; "
             "use self._safe_name(model_info)"
         )
+
+
+class TestInconclusiveHealthCheckGatesNothing:
+    """A probe that sees nothing must not decide the outcome.
+
+    On OCI amd-rccl every node comes back "Unreachable / srun failed" when probed
+    from the login node -- 46 of 46 in build 87. That is a fact about the probe.
+    Standing down has to be complete: the exclude list, the submission gate and the
+    nodelist pin all read the same empty result, and clearing only the first left
+    build 87 failing on "Not enough clean nodes: need 2, found 0" from a check that
+    had just announced it had nothing to say.
+    """
+
+    class _Sel:
+        def __init__(self, inconclusive):
+            if inconclusive:
+                self.health_check_inconclusive = True
+
+    @staticmethod
+    def _gate(selector, nodes, clean, allow=False):
+        """Mirrors the decision in slurm.py: gate, and whether to pin a nodelist."""
+        inconclusive = getattr(selector, "health_check_inconclusive", False)
+        blocked = nodes > 1 and not allow and not inconclusive and len(clean) < nodes
+        pinned = (not inconclusive) and len(clean) >= nodes
+        return blocked, pinned
+
+    def test_inconclusive_check_does_not_block(self):
+        blocked, _ = self._gate(self._Sel(True), 2, [])
+        assert blocked is False
+
+    def test_inconclusive_check_does_not_pin_a_nodelist(self):
+        """Pinning off a list the probe could not verify is worse than not pinning."""
+        _, pinned = self._gate(self._Sel(True), 2, ["a", "b", "c"])
+        assert pinned is False
+
+    def test_a_working_check_still_blocks_when_short(self):
+        blocked, _ = self._gate(self._Sel(False), 2, ["a"])
+        assert blocked is True
+
+    def test_a_working_check_still_pins_when_satisfied(self):
+        blocked, pinned = self._gate(self._Sel(False), 2, ["a", "b"])
+        assert blocked is False and pinned is True
+
+    def test_allow_submit_override_still_wins(self):
+        blocked, _ = self._gate(self._Sel(False), 2, [], allow=True)
+        assert blocked is False
+
+    def test_single_node_is_never_gated(self):
+        blocked, _ = self._gate(self._Sel(False), 1, [])
+        assert blocked is False
+
+    def test_selector_sets_the_flag_only_when_it_condemns_everything(self):
+        from madengine.deployment.slurm_node_selector import SlurmNodeSelector
+
+        sel = SlurmNodeSelector.__new__(SlurmNodeSelector)
+        assert getattr(sel, "health_check_inconclusive", False) is False

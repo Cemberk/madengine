@@ -1418,10 +1418,19 @@ export MASTER_PORT={master_port}
                     self.slurm_config["exclude"] = updated_exclude
                     self.prepare()
 
+                # An inconclusive check gates nothing. When every node it examined came
+                # back unreachable -- 46 of 46 on OCI amd-rccl, each one "srun failed" --
+                # the clean count is zero because the probe could not see anything, not
+                # because the cluster is full. Treat that exactly like enable_node_check
+                # being off: no exclusion, no gate, no nodelist pin, and let SLURM
+                # schedule.
+                inconclusive = getattr(selector, "health_check_inconclusive", False)
+
                 # Gate: do not submit if not enough clean nodes (multi-node only; single-node always allowed)
                 if (
                     self.nodes > 1
                     and not allow_submit_without_clean
+                    and not inconclusive
                     and len(clean_nodes) < self.nodes
                 ):
                     SlurmNodeSelector.cancel_health_check_jobs(
@@ -1437,7 +1446,7 @@ export MASTER_PORT={master_port}
                     )
 
                 # When we have enough clean nodes, pin the job to them via nodelist
-                if len(clean_nodes) >= self.nodes:
+                if not inconclusive and len(clean_nodes) >= self.nodes:
                     nodelist_str = ",".join(clean_nodes[: self.nodes])
                     self.slurm_config["nodelist"] = nodelist_str
                     self.console.print(f"[dim]Using nodelist: {nodelist_str}[/dim]\n")

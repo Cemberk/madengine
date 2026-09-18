@@ -528,6 +528,13 @@ echo "CLEANUP_OK"
         # has no signal to offer, so it stands down and lets SLURM schedule.
         examined = {st.node for st in statuses}
         if examined and examined.issubset(set(existing_exclude)):
+            # Flag it for the caller as well. Dropping the exclude list alone is half a
+            # stand-down: the caller also gates submission on len(clean_nodes), which is
+            # zero for exactly the same reason the exclude list named everything. Build 87
+            # cleared the exclusion and then failed anyway on "Not enough clean nodes:
+            # need 2, found 0" -- the check still deciding the outcome after announcing it
+            # had nothing to say.
+            self.health_check_inconclusive = True
             self.console.print(
                 f"[yellow]⚠ The health check excluded all {len(examined)} node(s) it "
                 f"examined, so it has no usable signal and is being disregarded.[/yellow]"
