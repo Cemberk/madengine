@@ -639,3 +639,83 @@ class TestInconclusiveHealthCheckGatesNothing:
 
         sel = SlurmNodeSelector.__new__(SlurmNodeSelector)
         assert getattr(sel, "health_check_inconclusive", False) is False
+
+
+class TestComputeNodesCanPullAPrivateImage:
+    """The generated job must be able to fetch the image it was told to run.
+
+    STANDALONE's wrapper does docker login on every node before pulling
+    (Jenkinsfile:2351). madengine's slurm_multi path pulled anonymously, so a
+    private repository answered "not found" for an image that was plainly there.
+    """
+
+    @staticmethod
+    def _emitted_login_block():
+        import inspect
+        import re
+
+        from madengine.deployment import slurm as mod
+
+        src = inspect.getsource(mod)
+        start = src.index(
+            '"# Authenticate to the registry, if credentials were exported to us.",'
+        )
+        end = src.index('"# Pull Docker image in parallel on all nodes",', start)
+        seg = src[start:end]
+        out = []
+        for m in re.finditer(
+            r"^\s+(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"),\s*$", seg, re.M
+        ):
+            out.append(m.group(1) if m.group(1) is not None else m.group(2))
+        return "\n".join(out)
+
+    def test_a_login_is_emitted_before_the_pull(self):
+        block = self._emitted_login_block()
+        assert "docker login" in block
+        assert "--password-stdin" in block
+
+    def test_it_accepts_both_credential_spellings(self):
+        """madengine's own names, and the ones the Jenkins wrapper binds."""
+        block = self._emitted_login_block()
+        for name in (
+            "MAD_DOCKERHUB_USER",
+            "MAD_DOCKERHUB_PASSWORD",
+            "MAD_DOCKER_USER",
+            "MAD_DOCKER_TOKEN",
+        ):
+            assert name in block, name
+
+    def test_only_names_are_written_never_values(self):
+        """This script is archived as a build artifact."""
+        block = self._emitted_login_block()
+        assert "--password-stdin" in block
+        assert "-p " not in block and "--password " not in block
+
+    def test_the_srun_body_has_no_apostrophes(self):
+        """One would close the single-quoted body and truncate the script."""
+        block = self._emitted_login_block()
+        i = block.index("bash -c '") + len("bash -c '")
+        j = block.index("\n    '", i)
+        assert block[i:j].count("'") == 0
+
+    def test_missing_credentials_are_not_an_error(self):
+        """A public image must still pull when nothing was exported."""
+        block = self._emitted_login_block()
+        assert "pulling anonymously" in block
+
+    def test_the_job_exports_its_environment(self):
+        """Without this the credentials never reach the node to begin with."""
+        import inspect
+
+        from madengine.deployment import slurm as mod
+
+        assert "#SBATCH --export=ALL" in inspect.getsource(mod)
+
+    def test_sbatch_output_paths_are_one_path_segment(self):
+        """--output spells it madengine-<name>, which the earlier sweep missed."""
+        import inspect
+
+        from madengine.deployment import slurm as mod
+
+        src = inspect.getsource(mod)
+        assert "madengine-{model_info['name']}" not in src

@@ -628,14 +628,26 @@ class SlurmDeployment(BaseDeployment):
 
         # Generate simple wrapper script
         # IMPORTANT: SBATCH directives MUST be at the top, right after #!/bin/bash
+        # The same one-path-segment rule as the script filename. These spell it
+        # madengine-<name> rather than madengine_<name>, which is why the earlier sweep
+        # missed them: a namespaced card would point --output at
+        # slurm_results/madengine-vllm_multinode/pyt_..._%j_%t.out, a directory nobody
+        # creates, and sbatch cannot write there.
+        _safe = self._safe_name(model_info)
         script_lines = [
             "#!/bin/bash",
-            f"#SBATCH --job-name=madengine-{model_info['name']}",
-            f"#SBATCH --output={self.output_dir}/madengine-{model_info['name']}_%j_%t.out",
-            f"#SBATCH --error={self.output_dir}/madengine-{model_info['name']}_%j_%t.err",
+            f"#SBATCH --job-name=madengine-{_safe}",
+            f"#SBATCH --output={self.output_dir}/madengine-{_safe}_%j_%t.out",
+            f"#SBATCH --error={self.output_dir}/madengine-{_safe}_%j_%t.err",
             f"#SBATCH --partition={self.partition}",
             f"#SBATCH --nodes={self.nodes}",
             f"#SBATCH --ntasks={self.nodes}",
+            # Carry the submitting environment to the compute nodes. A site can default
+            # sbatch to --export=NONE -- this file's own PATH comment says so -- and the
+            # registry credentials live in that environment and nowhere else. They are
+            # never written into this script: only variable NAMES appear below, and the
+            # values travel the same way the STANDALONE wrapper sends them.
+            "#SBATCH --export=ALL",
         ]
         if not self.skip_gpus_directive:
             script_lines.append(f"#SBATCH --gpus-per-node={self.gpus_per_node}")
@@ -720,10 +732,46 @@ class SlurmDeployment(BaseDeployment):
         )
 
         if is_registry_image:
-            # Add parallel docker pull on all nodes
-            # This ensures all nodes have the image before running
+            # Authenticate before pulling. A private repository -- rocm/mad-private, say --
+            # returns "not found" to an anonymous pull, so without this the parallel pull
+            # below fails on every node for an image that is plainly there.
+            #
+            # madengine already knows these names: core/auth.py reads MAD_DOCKERHUB_USER
+            # and MAD_DOCKERHUB_PASSWORD from the environment. MAD_DOCKER_USER /
+            # MAD_DOCKER_TOKEN are accepted as well because that is what the Jenkins
+            # STANDALONE wrapper binds, and a card should not need different credential
+            # names depending on which path runs it.
+            #
+            # Only the NAMES are written here. The values arrive through --export=ALL from
+            # the submitting shell, exactly as the STANDALONE wrapper receives them, so this
+            # script stays safe to archive as a build artifact.
+            #
+            # Absent credentials are not an error: a public image pulls fine without them,
+            # and the pull itself reports the failure if the image really was private.
             script_lines.extend(
                 [
+                    "",
+                    "# Authenticate to the registry, if credentials were exported to us.",
+                    "# Single-quoted srun body on purpose: the variables are read on the",
+                    "# compute node, which --export=ALL has already given them to, so nothing",
+                    "# needs interpolating from the batch shell and nothing needs escaping.",
+                    "# No apostrophes inside -- one would close this string and truncate the",
+                    "# script, which is how two MAD launchers broke this week.",
+                    'if [ -n "${MAD_DOCKERHUB_USER:-${MAD_DOCKER_USER:-}}" ]; then',
+                    "    echo 'Logging in to the registry on all nodes'",
+                    "    srun --nodes=$SLURM_NNODES --ntasks=$SLURM_NNODES bash -c '",
+                    '        _u="${MAD_DOCKERHUB_USER:-${MAD_DOCKER_USER:-}}"',
+                    '        _p="${MAD_DOCKERHUB_PASSWORD:-${MAD_DOCKER_TOKEN:-}}"',
+                    '        if printf %s "$_p" | docker login -u "$_u" --password-stdin >/dev/null 2>&1; then',
+                    '            echo "[$(hostname)] docker login OK"',
+                    "        else",
+                    '            echo "[$(hostname)] docker login FAILED; a private image will not pull"',
+                    "        fi",
+                    "    '",
+                    "else",
+                    "    echo 'No registry credentials exported; pulling anonymously.'",
+                    "    echo '  Set MAD_DOCKERHUB_USER and MAD_DOCKERHUB_PASSWORD if the image is private.'",
+                    "fi",
                     "",
                     "# Pull Docker image in parallel on all nodes",
                     "echo '=========================================='",
