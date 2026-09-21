@@ -719,3 +719,64 @@ class TestComputeNodesCanPullAPrivateImage:
 
         src = inspect.getsource(mod)
         assert "madengine-{model_info['name']}" not in src
+
+
+class TestNodeIPsAndLoginCannotBreakTheJob:
+    """Two defects build 90 exposed in the generated slurm_multi script.
+
+        │ Node IPs: 127.0.1.1,10.158.213.181
+        │ Logging in to the registry on all nodes
+        <job FAILED, log ends here>
+
+    Rank 0's address was loopback, and the log stops dead on the login line.
+    """
+
+    @staticmethod
+    def _emitted(start, end):
+        import inspect
+        import re
+
+        from madengine.deployment import slurm as mod
+
+        src = inspect.getsource(mod)
+        i = src.index(start)
+        j = src.index(end, i)
+        out = []
+        for m in re.finditer(
+            r"^\s+r?(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"),\s*$", src[i:j], re.M
+        ):
+            t = m.group(1) if m.group(1) is not None else m.group(2)
+            out.append(t.replace('\\"', '"').replace("\\\\", "\\"))
+        return "\n".join(out)
+
+    def test_loopback_addresses_are_rejected(self):
+        """getent on the batch node answers 127.0.1.1 for its OWN hostname."""
+        blk = self._emitted('"# Reject loopback.', '"export MAD_NODE_IPS",')
+        assert "grep -v '^127\\." in blk
+
+    def test_a_loopback_answer_falls_back_to_asking_the_node(self):
+        """hostname -I on the node cannot return someone else's loopback."""
+        blk = self._emitted('"# Reject loopback.', '"export MAD_NODE_IPS",')
+        assert "hostname -I" in blk
+        assert "--nodelist=" in blk
+
+    def test_the_fallback_takes_one_address_not_the_whole_line(self):
+        """hostname -I prints every interface, docker bridges included."""
+        blk = self._emitted('"# Reject loopback.', '"export MAD_NODE_IPS",')
+        assert "awk '{print $1}'" in blk
+
+    def test_the_login_cannot_end_the_job(self):
+        """The script runs under set -e; a best-effort step must be guarded."""
+        blk = self._emitted(
+            '"# Authenticate to the registry',
+            '"# Pull Docker image in parallel on all nodes",',
+        )
+        assert "|| echo" in blk, "the login srun is unguarded under set -e"
+
+    def test_the_generated_script_still_sets_e(self):
+        """If this stops being true the guard above is merely harmless."""
+        import inspect
+
+        from madengine.deployment import slurm as mod
+
+        assert '"set -e",' in inspect.getsource(mod)
