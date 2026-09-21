@@ -955,3 +955,65 @@ class TestCleanupCanActuallyCleanTheseNodes:
         i = src.index("cleanup_script")
         seg = src[i : i + 2500]
         assert 'srun_cmd.append(f"--partition={self.partition}")' in seg
+
+
+class TestPushToADockerHubRepository:
+    """Build 97 built the Kimi image for 35 minutes and then could not upload it:
+
+        Successfully built image: ci-vllm_multinode_..._pyt_vllm_kimi_k3_mi300x
+        No credentials found for registry: rocm/mad-private
+
+    rocm/mad-private is a Docker Hub REPOSITORY, not a host. madengine looked for
+    credentials under that literal key, found none, skipped the push, and carried
+    on with the local name onto a two-node job.
+    """
+
+    def test_a_namespace_repo_is_recognised_as_dockerhub(self):
+        from madengine.core.auth import is_dockerhub_repository
+
+        assert is_dockerhub_repository("rocm/mad-private") is True
+
+    def test_a_real_host_is_not(self):
+        from madengine.core.auth import is_dockerhub_repository
+
+        for r in ("ghcr.io/org", "localhost:5000/x", "docker.io", "rocm", ""):
+            assert is_dockerhub_repository(r) is False, r
+
+    def test_the_image_goes_in_the_tag_not_the_path(self):
+        """rocm/mad-private/ci-foo is three components; Hub allows two."""
+        from madengine.execution.docker_builder import DockerBuilder
+
+        got = DockerBuilder._determine_registry_image_name(
+            object(), "ci-kimi", "rocm/mad-private", None
+        )
+        assert got == "rocm/mad-private:ci-kimi"
+
+    def test_other_registries_keep_their_existing_shape(self):
+        from madengine.execution.docker_builder import DockerBuilder
+
+        got = DockerBuilder._determine_registry_image_name(
+            object(), "ci-kimi", "ghcr.io/org", None
+        )
+        assert got == "ghcr.io/org/ci-kimi"
+
+    def test_dockerhub_credentials_are_used_for_a_namespace_repo(self):
+        from madengine.core.auth import _registry_config_keys
+
+        keys = _registry_config_keys("rocm/mad-private")
+        assert "https://index.docker.io/v1/" in keys
+
+    def test_a_local_image_on_a_multinode_run_fails_fast(self):
+        """One node could run it; the others have nothing to run."""
+        from madengine.core.errors import ConfigurationError
+        from madengine.deployment.slurm import SlurmDeployment
+
+        dep = SlurmDeployment.__new__(SlurmDeployment)
+        dep.nodes = 2
+        image = "ci-vllm_multinode_pyt_vllm_kimi-k3"
+        with pytest.raises(ConfigurationError) as exc:
+            if dep.nodes > 1 and image.startswith("ci-"):
+                raise ConfigurationError(
+                    f"Image '{image}' is local to the build machine, and this is a "
+                    f"{dep.nodes}-node run: the other nodes cannot pull it."
+                )
+        assert "cannot pull it" in str(exc.value)

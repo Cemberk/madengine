@@ -746,6 +746,25 @@ class SlurmDeployment(BaseDeployment):
         # Check if image needs parallel pull on all nodes
         # Pull if: image is from registry (contains / or .) and not a local ci-* build
         docker_image = env_vars.get("DOCKER_IMAGE_NAME", "")
+
+        # A local ci-* image exists only on the machine that built it. One node can
+        # run it; the others have nothing to run. Build 97 spent 35 minutes building
+        # the image, failed to push it, carried on with the local name, and the job
+        # then failed on nodes that had never seen it -- a multi-node run with a
+        # local-only image cannot succeed, so say so here rather than after an
+        # allocation.
+        if self.nodes > 1 and docker_image.startswith("ci-"):
+            raise ConfigurationError(
+                f"Image '{docker_image}' is local to the build machine, and this is a "
+                f"{self.nodes}-node run: the other nodes cannot pull it.\n"
+                "  The push to the registry did not happen -- look for 'No credentials "
+                "found for registry' earlier in this log.\n"
+                "  Fix by one of:\n"
+                "    - set the registry to a Docker Hub repository (e.g. rocm/mad-private) "
+                "with MAD_DOCKERHUB_USER and MAD_DOCKERHUB_PASSWORD exported;\n"
+                "    - pass an already-pushed image with --use-image;\n"
+                "    - run single-node, where a local image is enough."
+            )
         is_registry_image = (
             docker_image
             and not docker_image.startswith("ci-")

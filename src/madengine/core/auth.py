@@ -54,7 +54,10 @@ def load_credentials() -> Optional[Dict]:
             with open(credential_file) as f:
                 loaded = json.load(f)
             if not isinstance(loaded, dict):
-                raise ValueError("credential.json must contain a JSON object, not " + type(loaded).__name__)
+                raise ValueError(
+                    "credential.json must contain a JSON object, not "
+                    + type(loaded).__name__
+                )
             credentials = loaded
             print(
                 f"Loaded credentials from {credential_file}: "
@@ -111,7 +114,32 @@ def _registry_config_keys(registry: Optional[str]) -> Tuple[str, ...]:
     host = registry.split("/")[0]
     if host.lower() in _DOCKERHUB_ALIASES:
         return _DOCKERHUB_CONFIG_KEYS
+    # "rocm/mad-private" is a Docker Hub REPOSITORY, not a host. A hostname has a
+    # dot or a port; a bare first segment does not. Without this, a registry given
+    # as namespace/repo looked for credentials under the key "rocm/mad-private",
+    # found none, and the push was skipped -- build 97 spent 35 minutes building an
+    # image it then could not upload, and ran the local name instead.
+    if is_dockerhub_repository(registry):
+        return _DOCKERHUB_CONFIG_KEYS
     return (host,)
+
+
+def is_dockerhub_repository(registry: Optional[str]) -> bool:
+    """True when ``registry`` names a Docker Hub repository rather than a host.
+
+    Docker Hub repositories are exactly two segments (``namespace/repo``) and the
+    first carries no dot and no port, which is what separates ``rocm/mad-private``
+    from ``ghcr.io/org`` or ``localhost:5000/x``.
+    """
+    if not registry:
+        return False
+    parts = registry.split("/")
+    if len(parts) != 2 or not all(parts):
+        return False
+    host = parts[0]
+    return (
+        "." not in host and ":" not in host and host.lower() not in _DOCKERHUB_ALIASES
+    )
 
 
 def has_ambient_docker_auth(registry: Optional[str]) -> bool:
@@ -368,7 +396,7 @@ def login_to_registry(
     # Pass the password via an environment variable so it never appears in
     # the process argument list (visible via /proc or ps to other users).
     quoted_username = shlex.quote(username)
-    login_command = "printf %s \"$MAD_REGISTRY_PASSWORD\" | docker login"
+    login_command = 'printf %s "$MAD_REGISTRY_PASSWORD" | docker login'
     if registry and registry.lower() not in ["docker.io", "dockerhub"]:
         login_command += f" {shlex.quote(str(registry))}"
     login_command += f" --username {quoted_username} --password-stdin"
@@ -382,8 +410,6 @@ def login_to_registry(
             f"{registry or 'DockerHub'}[/green]"
         )
     except Exception as e:
-        rich_console.print(
-            f"[red]Failed to login to registry {registry}: {e}[/red]"
-        )
+        rich_console.print(f"[red]Failed to login to registry {registry}: {e}[/red]")
         if raise_on_failure:
             raise
