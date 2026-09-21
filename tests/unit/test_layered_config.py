@@ -996,49 +996,60 @@ class TestALocalImageCannotRunMultinode:
 
 
 class TestAPushedImageIsTheOneThatRuns:
-    """Build 98 pushed an image and then ran a name the nodes could not pull.
+    """Builds 98 and 99 pushed an image and then ran a name the nodes could not pull.
 
         Successfully pushed: rocm/mad-private:ci-vllm_multinode_..._kimi_k3...
         Using built Docker image: ci-vllm_multinode_..._kimi_k3...
         docker: Error response from daemon: pull access denied
 
-    The manifest KEY is the local build name; model_info["docker_image"] carries
-    what the build recorded, which is the registry reference once a push happens.
-    Preferring the key threw the push away.
+    build_info["docker_image"] is set before the push and never updated;
+    build_info["registry_image"] is what the push records. docker_builder already
+    propagates the latter into built_models env_vars "for parallel pull in
+    slurm_multi" -- and this block was overwriting it with the local manifest key.
     """
 
     @staticmethod
-    def _pick(key, recorded):
-        """Mirrors the decision in _prepare_slurm_multi_script."""
-        rec = recorded or ""
-        if rec and not rec.startswith("ci-"):
-            return rec
+    def _usable(ref):
+        return bool(ref) and not ref.startswith("ci-") and not ref.startswith("<")
+
+    @classmethod
+    def _pick(cls, entry, already, recorded, key):
+        """Mirrors the resolution order in _prepare_slurm_multi_script."""
+        from_push = entry.get("registry_image") or ""
+        if cls._usable(from_push):
+            return from_push
+        if cls._usable(already):
+            return already
+        if cls._usable(recorded):
+            return recorded
         if key and key.startswith("ci-"):
             return key
-        return rec
+        return ""
 
-    def test_a_pushed_registry_image_wins(self):
-        assert (
-            self._pick("ci-kimi", "rocm/mad-private:ci-kimi")
-            == "rocm/mad-private:ci-kimi"
-        )
+    def test_the_pushed_image_wins(self):
+        pushed = "rocm/mad-private:ci-kimi"
+        got = self._pick({"registry_image": pushed}, pushed, "ci-kimi", "ci-kimi")
+        assert got == pushed
 
-    def test_a_local_build_with_no_push_still_uses_the_key(self):
-        """Single-node off a local build is a legitimate case."""
-        assert self._pick("ci-kimi", "ci-kimi") == "ci-kimi"
+    def test_a_local_build_with_no_push_uses_the_key(self):
+        """Legitimate for single-node; the multi-node guard refuses it."""
+        got = self._pick({}, "<supply-your-image>", "ci-kimi", "ci-kimi")
+        assert got == "ci-kimi"
 
     def test_a_use_image_override_is_honoured(self):
-        assert (
-            self._pick("rocm/mad-private:tag", "rocm/mad-private:tag")
-            == "rocm/mad-private:tag"
-        )
+        ref = "rocm/mad-private:pyt_vllm_kimi_k3_mi300x-db276a66649a"
+        assert self._pick({}, ref, ref, "ci-kimi") == ref
 
-    def test_the_source_prefers_the_recorded_image(self):
+    def test_a_card_placeholder_is_never_selected(self):
+        """'<supply-your-image>' must not reach a compute node."""
+        assert self._pick({}, "<supply-your-image>", "", "ci-kimi") == "ci-kimi"
+
+    def test_the_source_reads_registry_image_before_the_key(self):
         import inspect
 
         from madengine.deployment import slurm as mod
 
         src = inspect.getsource(mod)
-        i = src.index("_pushed = bool(_recorded)")
+        i = src.index('_entry.get("registry_image")')
         j = src.index('docker_image_name.startswith("ci-")', i)
-        assert i < j, "the local key is still being checked first"
+        assert i < j, "the local manifest key is still checked first"

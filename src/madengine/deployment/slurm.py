@@ -572,42 +572,47 @@ class SlurmDeployment(BaseDeployment):
             if "yD" not in env_vars:
                 env_vars["yD"] = str(sglang_disagg_config.get("decode_nodes", 1))
 
-        # Override DOCKER_IMAGE_NAME with the built image from manifest.
+        # Resolve the image the COMPUTE NODES will pull.
         #
-        # A PUSHED image wins over the manifest key. The key is the LOCAL build name
-        # (ci-<model>_<dockerfile>), while model_info["docker_image"] holds whatever
-        # the build recorded -- the registry reference when a push happened
-        # (build_orchestrator writes the registry image into all three fields).
-        # Preferring the key meant a successful push was then ignored: build 98
-        # pushed
-        #     rocm/mad-private:ci-vllm_multinode_..._pyt_vllm_kimi_k3_mi300x.ubuntu.amd
-        # and ran
-        #     ci-vllm_multinode_..._pyt_vllm_kimi_k3_mi300x.ubuntu.amd
-        # so the compute nodes got "pull access denied" for an image that was
-        # sitting in the registry under a name nobody passed them.
+        # docker_builder already does the right thing: after a push it writes the
+        # registry reference into built_models[...]["env_vars"]["DOCKER_IMAGE_NAME"],
+        # with a comment saying it is there "for parallel pull in slurm_multi". By
+        # the time this runs, env_vars therefore already holds the pushed name.
         #
-        # The key is still the right answer when nothing was pushed -- a single-node
-        # run off a local build -- so it stays as the fallback.
+        # This block used to overwrite it with the manifest KEY, which is the LOCAL
+        # build name (ci-<model>_<dockerfile>) -- build_info["docker_image"] is set
+        # before the push and never updated, while build_info["registry_image"] is
+        # what the push records. So builds 98 and 99 pushed
+        #     rocm/mad-private:ci-vllm_multinode_..._kimi_k3_mi300x.ubuntu.amd
+        # and then ran the ci- name, and the nodes got "pull access denied" for an
+        # image that was already in the registry.
+        #
+        # Order: what the push recorded, then anything already resolved to a
+        # registry reference, then the manifest key -- which is still correct when
+        # nothing was pushed, e.g. a single-node run off a local build.
+        _entry = (self.manifest.get("built_images") or {}).get(docker_image_name, {})
+        _from_push = _entry.get("registry_image") or ""
+        _already = str(env_vars.get("DOCKER_IMAGE_NAME") or "")
         _recorded = model_info.get("docker_image") or model_info.get("image") or ""
-        _pushed = bool(_recorded) and not _recorded.startswith("ci-")
-        if _pushed:
-            self.console.print(f"[cyan]Using pushed Docker image: {_recorded}[/cyan]")
+
+        def _usable(ref):
+            return bool(ref) and not ref.startswith("ci-") and not ref.startswith("<")
+
+        if _usable(_from_push):
+            self.console.print(f"[cyan]Using pushed Docker image: {_from_push}[/cyan]")
+            env_vars["DOCKER_IMAGE_NAME"] = _from_push
+        elif _usable(_already):
+            self.console.print(f"[cyan]Using Docker image: {_already}[/cyan]")
+        elif _usable(_recorded):
+            self.console.print(f"[cyan]Using Docker image: {_recorded}[/cyan]")
             env_vars["DOCKER_IMAGE_NAME"] = _recorded
         elif docker_image_name and docker_image_name.startswith("ci-"):
-            # The manifest key IS the built image name for madengine-built images
+            # Local build, nothing pushed. Correct for a single-node run; the
+            # multi-node guard below refuses it.
             self.console.print(
                 f"[cyan]Using built Docker image: {docker_image_name}[/cyan]"
             )
             env_vars["DOCKER_IMAGE_NAME"] = docker_image_name
-        elif "docker_image" in model_info:
-            built_image = model_info["docker_image"]
-            self.console.print(f"[cyan]Using Docker image: {built_image}[/cyan]")
-            env_vars["DOCKER_IMAGE_NAME"] = built_image
-        elif "image" in model_info:
-            # Fallback to 'image' field
-            built_image = model_info["image"]
-            self.console.print(f"[cyan]Using Docker image: {built_image}[/cyan]")
-            env_vars["DOCKER_IMAGE_NAME"] = built_image
 
         # Under require_pinned_image, pin DOCKER_IMAGE_NAME to the digest recorded
         # at build time. slurm_multi runs the model's own script (no nested
