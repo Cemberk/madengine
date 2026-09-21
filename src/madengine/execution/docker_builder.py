@@ -22,7 +22,6 @@ from rich.console import Console as RichConsole
 from madengine.core.auth import (
     explain_registry_denial,
     has_ambient_docker_auth,
-    is_dockerhub_repository,
     login_to_registry,
 )
 from madengine.core.console import Console
@@ -1038,15 +1037,6 @@ class DockerBuilder:
         """
         if not registry:
             return docker_image
-
-        # A registry given as namespace/repo is a Docker Hub REPOSITORY, and the
-        # image belongs in its TAG: rocm/mad-private:ci-foo. Treating it as a host
-        # produced rocm/mad-private/ci-foo -- three path components, which Hub
-        # rejects -- and build 97 built for 35 minutes before finding that out.
-        # This is the convention the STANDALONE pipeline already uses for the same
-        # value, so the same REGISTRY_URL now means the same thing on both paths.
-        if is_dockerhub_repository(registry):
-            return f"{registry}:{docker_image}"
 
         # Determine registry image name based on registry type
         if registry.lower() in ["docker.io", "dockerhub"]:

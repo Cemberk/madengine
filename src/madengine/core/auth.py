@@ -114,32 +114,7 @@ def _registry_config_keys(registry: Optional[str]) -> Tuple[str, ...]:
     host = registry.split("/")[0]
     if host.lower() in _DOCKERHUB_ALIASES:
         return _DOCKERHUB_CONFIG_KEYS
-    # "rocm/mad-private" is a Docker Hub REPOSITORY, not a host. A hostname has a
-    # dot or a port; a bare first segment does not. Without this, a registry given
-    # as namespace/repo looked for credentials under the key "rocm/mad-private",
-    # found none, and the push was skipped -- build 97 spent 35 minutes building an
-    # image it then could not upload, and ran the local name instead.
-    if is_dockerhub_repository(registry):
-        return _DOCKERHUB_CONFIG_KEYS
     return (host,)
-
-
-def is_dockerhub_repository(registry: Optional[str]) -> bool:
-    """True when ``registry`` names a Docker Hub repository rather than a host.
-
-    Docker Hub repositories are exactly two segments (``namespace/repo``) and the
-    first carries no dot and no port, which is what separates ``rocm/mad-private``
-    from ``ghcr.io/org`` or ``localhost:5000/x``.
-    """
-    if not registry:
-        return False
-    parts = registry.split("/")
-    if len(parts) != 2 or not all(parts):
-        return False
-    host = parts[0]
-    return (
-        "." not in host and ":" not in host and host.lower() not in _DOCKERHUB_ALIASES
-    )
 
 
 def has_ambient_docker_auth(registry: Optional[str]) -> bool:
