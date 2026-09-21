@@ -13,9 +13,15 @@ Those are not three ways of doing one thing. They are three layers, separated by
 WHERE IN THE PIPELINE the value is created -- which is also who reviews a change
 to it. They overlap only where one team had to reach into another's territory.
 
-This module implements a fourth way: a single file carrying those same layers,
-separated explicitly. It exists so a team that wants the whole picture in one
-place can have it, without any of the other three changing.
+This module implements a fourth way: a single file carrying the layers that
+travel WITH A MODEL -- how it is served, and what is measured. It exists so a
+team that wants those in one reviewable place can have it, without any of the
+other three changing.
+
+It deliberately stops at the model boundary. Site facts and run shape are
+configured per RUN, not per model, and madengine composes those from Hydra config
+groups (scheduler, launcher, +profile, +env). A model card is the wrong place to
+say what a cluster is.
 
 It resolves to a plain environment dict -- exactly what ways 1-3 already consume --
 so adopting it requires no change to any workload script. It is a front end, not a
@@ -220,7 +226,6 @@ def resolve_env(
 
     Lowest precedence first:
 
-        site          where the value is created: whoever provisions the cluster
         model         whoever tuned this model on this hardware
         benchmark     whoever defines the measurement
         model_env     the card's own env_vars
@@ -229,9 +234,27 @@ def resolve_env(
     The last two are placed above the file so an operator pinning something at
     submit time still wins, which is the property every one of the three existing
     formats already relies on.
+
+    runtime_env is also where Hydra lands: --config translates to
+    additional_context, so `--config +env=nccl_debug` outranks anything a card
+    declares. That is the right way round -- a run-level override should beat a
+    model default -- and it composes without either side knowing about the other.
+
+    There is no 'site' layer. Site facts are a property of the run, and belong to
+    a Hydra group or to cluster.sh; see docs/distributed-config.md.
     """
     merged: Dict[str, Any] = {}
-    merged = ConfigLoader.deep_merge(merged, _env_of(config.get("site")))
+    if config.get("site"):
+        # Not silently ignored: a dropped setting that looks applied is the exact
+        # failure this module exists to prevent.
+        raise LayeredConfigError(
+            "'site:' is no longer read here. Site facts belong to the run, not to a "
+            "model card, and madengine now composes them from Hydra config groups "
+            "(--config +profile=..., --config +env=...) or from cluster.sh.\n"
+            "  Move each key to whichever of those owns it, and keep 'model:' and "
+            "'benchmark:' here -- those are per-model and per-measurement, which no "
+            "Hydra group can express."
+        )
     merged = ConfigLoader.deep_merge(merged, _env_of(config.get("model")))
     for entry in _benchmark_entries(config, benchmark):
         merged = ConfigLoader.deep_merge(merged, _env_of(entry))

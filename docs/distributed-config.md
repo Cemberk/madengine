@@ -1,27 +1,51 @@
 # Configuring distributed inference
 
-Distributed inference workloads are configured four different ways. Three of them
-already exist and are owned by the teams that authored them; madengine supports all
-three unchanged. The fourth is madengine's own, for anyone who wants the whole
-picture in one file.
+Configuration for these workloads is split across five places, owned by four
+teams. They are not five ways of doing one thing, and the numbering they used to
+carry implied a competition that does not exist. What separates them is **scope**:
 
-The organising idea is **where in the pipeline a value is created**, because that is
-also who reviews a change to it:
+| scope | who decides it | where it lives |
+|-------|----------------|----------------|
+| **the run** | whoever launches this job | `madengine --config` (Hydra groups: `scheduler`, `launcher`, `+profile`, `+env`, `+tools`) |
+| **the site** | whoever provisioned the cluster | `cluster.sh`, and Hydra `+profile` / `+env` |
+| **the model** | whoever tuned it on that hardware | `scripts/<dir>/models.yaml`, `mad-config.yaml` |
+| **the measurement** | whoever defines the benchmark | `scripts/<dir>/configs/*.yaml`, `mad-config.yaml` |
 
-| way | file | created by | carries |
-|-----|------|-----------|---------|
-| 1 | `scripts/<dir>/models.yaml` | whoever tuned the model on that hardware | serve flags per model × role × mode, model env |
-| 2 | `scripts/<dir>/configs/{default,perf,acc}.yaml` | whoever defines the measurement | benchmark kind, knobs, `extra_args`, env |
-| 3 | `cluster.sh` | whoever provisioned the cluster | site facts as `${VAR:-default}` |
-| 4 | `mad-config.yaml` | all three, in labelled sections | the same three layers, explicitly separated |
+Read it as a question of lifetime. A run-level value is chosen fresh each time
+someone launches; a site value is true of a cluster until it is re-provisioned; a
+model value travels with the model wherever it runs. Putting a value in the wrong
+scope is how it ends up correct in one place and stale in another.
 
-These are not four ways of doing one thing. Ways 1–3 are three *layers*, and they
-overlap only where a team needed something another layer owned. Way 4 is those same
-layers in one file.
-
-Whatever you use, it ends up as **environment variables** reaching the workload,
+Whatever the scope, it ends up as **environment variables** reaching the workload,
 because that is the only thing that survives both the container boundary and the
 choice of launcher.
+
+## How the run level composes with the rest
+
+`madengine --config` translates Hydra YAML into exactly the `additional_context`
+that `--additional-context` produces -- it is a front end, not a separate
+mechanism. So a run-level value lands at the TOP of the precedence chain:
+
+```
+model                    from mad-config.yaml
+benchmark                from mad-config.yaml, by kind
+model_info.env_vars      the card's own env_vars
+additional_context       -e at submit time, AND everything --config composes  (highest)
+```
+
+That is the right way round: `--config +env=nccl_debug` should beat a model
+default, and a model default should beat nothing at all. The two systems compose
+without either knowing about the other.
+
+One caveat worth knowing before switching a pipeline to `--config`: a plain user
+YAML translates to a byte-identical context, but composing the same thing from a
+config GROUP does not -- the group brings its own defaults. `scheduler=slurm`
+adds `OMP_NUM_THREADS` and `MIOPEN_FIND_MODE` to `env_vars`, among others. A
+benchmark whose environment changed because of how its config was spelled is
+exactly what this document exists to prevent, so a pipeline that cares about
+reproducing a number should pass a file rather than compose from groups.
+
+---
 
 ## Any one of them is enough
 
@@ -95,11 +119,6 @@ One file, three labelled sections, one per creation point.
 ```yaml
 version: 1
 
-site:                       # created by: whoever provisioned the cluster
-  env:
-    NVME_ROOT: /mnt/m2m_nobackup
-    SHARED_MOUNT: /shared_inference
-
 model:                      # created by: whoever tuned this model
   id: moonshotai/Kimi-K3    # how way 2 names it
   local_name: Kimi-K3       # how ways 1 and 3 name it (the on-disk directory)
@@ -138,15 +157,19 @@ Lowest first. The last two are above the file so an operator pinning something a
 submit time still wins, which is what all three existing formats already rely on:
 
 ```
-site                                    from mad-config.yaml
 model                                   from mad-config.yaml
 benchmark  (task-level, then by kind)   from mad-config.yaml
 model_info.env_vars                     the card's own env_vars
-additional_context.env_vars             -e / submit-time override   (highest)
+additional_context.env_vars             -e, and everything --config composes (highest)
 ```
 
-Layers **merge**, they do not replace: a key set only in `site` survives a `model`
-section that does not mention it.
+Layers **merge**, they do not replace: a key set only in `model` survives a
+`benchmark` section that does not mention it.
+
+There is no `site:` layer, and a file carrying one is **refused rather than
+ignored** -- a dropped setting that looks applied is the failure this whole
+document is about. Site facts belong to the run: a Hydra `+profile` / `+env`
+group, or `cluster.sh`.
 
 ### Serve flags are a map, not a string
 
@@ -234,9 +257,21 @@ and the run still reports a number measured over the wrong transport.
 
 ## Choosing
 
-- **Tuning a model's serve recipe** → way 1 (`models.yaml`); it owns the role × mode axis.
-- **Defining what to measure** → way 2 (`configs/*.yaml`); it owns benchmark selection and inheritance.
-- **Describing a cluster** → way 3 (`cluster.sh`); every value `${VAR:-default}` so the environment always wins.
-- **Wanting all three in one reviewable file, on the madengine path** → way 4.
+Pick by **how long the value should outlive the run**:
+
+- **Chosen fresh for this launch** (which scheduler, which profile, debug env)
+  &rarr; `madengine --config`. Nothing else is re-decided per run.
+- **True of the cluster until it is re-provisioned** (weight roots, NIC list,
+  fabric archetype) &rarr; `cluster.sh`, or a Hydra `+profile` / `+env` group.
+  Every value `${VAR:-default}` so the environment still wins.
+- **Travels with the model wherever it runs** (serve flags per role &times; mode)
+  &rarr; `models.yaml`; it owns the role &times; mode axis nothing else has.
+- **Defines the measurement** (benchmark kind, knobs, `extra_args`)
+  &rarr; `configs/*.yaml`.
+- **Wanting a model's serve recipe and its measurement in one reviewable file, on
+  the madengine path** &rarr; `mad-config.yaml`.
+
+If a value seems to belong in two of these, it is usually two different values
+that happen to share a name today -- and they will drift.
 
 Related: [configuration.md](configuration.md), [launchers.md](launchers.md).

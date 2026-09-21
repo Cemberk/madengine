@@ -92,20 +92,20 @@ class TestServeArgs:
 
 
 class TestEnvPrecedence:
-    """site < model < benchmark < card env_vars < submit-time override."""
+    """model < benchmark < card env_vars < submit-time override.
+
+    There is no site layer: site facts are a property of the run, and madengine
+    composes those from Hydra groups or cluster.sh.
+    """
 
     CONFIG = {
         "version": 1,
-        "site": {"env": {"NVME_ROOT": "/mnt/site", "SHARED": "/shared"}},
         "model": {"env": {"NVME_ROOT": "/mnt/model", "AITER": "1"}},
         "benchmark": [
             {"env": {"SEEDS": "3"}},
             {"kind": "niah", "env": {"AITER": "0", "NIAH_WORDS": "10000"}},
         ],
     }
-
-    def test_model_beats_site(self):
-        assert resolve_env(self.CONFIG)["NVME_ROOT"] == "/mnt/model"
 
     def test_task_level_benchmark_defaults_always_apply(self):
         assert resolve_env(self.CONFIG)["SEEDS"] == "3"
@@ -117,27 +117,47 @@ class TestEnvPrecedence:
         assert "NIAH_WORDS" not in resolve_env(self.CONFIG)
 
     def test_card_env_beats_file(self):
-        env = resolve_env(self.CONFIG, model_env={"NVME_ROOT": "/mnt/card"})
-        assert env["NVME_ROOT"] == "/mnt/card"
+        got = resolve_env(self.CONFIG, model_env={"AITER": "card"})
+        assert got["AITER"] == "card"
 
     def test_runtime_override_wins_everything(self):
-        env = resolve_env(
+        got = resolve_env(
             self.CONFIG,
-            model_env={"NVME_ROOT": "/mnt/card"},
-            runtime_env={"NVME_ROOT": "/mnt/runtime"},
+            model_env={"AITER": "card"},
+            runtime_env={"AITER": "runtime"},
+            benchmark="niah",
         )
-        assert env["NVME_ROOT"] == "/mnt/runtime"
+        assert got["AITER"] == "runtime"
 
     def test_layers_merge_rather_than_replace(self):
-        # SHARED comes only from site, AITER only from model: a lower layer's
-        # keys must survive a higher layer that does not mention them.
-        env = resolve_env(self.CONFIG)
-        assert env["SHARED"] == "/shared"
-        assert env["AITER"] == "1"
+        """A key set only in model survives a benchmark that never mentions it."""
+        got = resolve_env(self.CONFIG, benchmark="niah")
+        assert got["NVME_ROOT"] == "/mnt/model"
 
-    def test_values_are_stringified(self):
-        env = resolve_env({"version": 1, "model": {"env": {"MAX_LEN": 16384}}})
-        assert env["MAX_LEN"] == "16384"
+    def test_hydra_lands_at_the_top(self):
+        """--config translates to additional_context, which is runtime_env.
+
+        So a run-level group outranks a model default, which is the right way
+        round and is what lets the two systems compose without either knowing
+        about the other.
+        """
+        got = resolve_env(self.CONFIG, runtime_env={"NVME_ROOT": "/from/hydra"})
+        assert got["NVME_ROOT"] == "/from/hydra"
+
+
+class TestSiteLayerIsRefusedNotIgnored:
+    """A dropped setting that looks applied is the failure this module prevents."""
+
+    def test_a_site_block_raises_and_says_where_it_went(self):
+        with pytest.raises(LayeredConfigError) as exc:
+            resolve_env({"version": 1, "site": {"env": {"NVME_ROOT": "/mnt"}}})
+        msg = str(exc.value)
+        assert "no longer read" in msg
+        assert "+profile" in msg and "cluster.sh" in msg
+
+    def test_a_config_without_site_is_unaffected(self):
+        got = resolve_env({"version": 1, "model": {"env": {"A": "1"}}})
+        assert got == {"A": "1"}
 
 
 class TestLoad:
@@ -234,10 +254,6 @@ class TestResolveForModel:
             tmp_path,
             """
             version: 1
-            site:
-              env:
-                NVME_ROOT: /mnt/m2m_nobackup
-                SHARED_MOUNT: /shared_inference
             model:
               id: moonshotai/Kimi-K3
               local_name: Kimi-K3
@@ -258,9 +274,10 @@ class TestResolveForModel:
         )
 
         # What the same card expresses today, as a flat env_vars block (way 1-3).
+        # NVME_ROOT and SHARED_MOUNT are deliberately absent: they are site facts,
+        # and site facts are configured per RUN now -- a Hydra +profile/+env group
+        # or cluster.sh -- not per model.
         way123 = {
-            "NVME_ROOT": "/mnt/m2m_nobackup",
-            "SHARED_MOUNT": "/shared_inference",
             "MODEL_NAME": "Kimi-K3",
             "TP_SIZE": "8",
             "PP_SIZE": "2",
@@ -422,7 +439,7 @@ class TestEachWayStandsAlone:
 
     def test_way4_alone_needs_no_card_env(self, tmp_path):
         (tmp_path / "mad-config.yaml").write_text(
-            "version: 1\nsite:\n  env:\n    NVME_ROOT: /mnt/nvme\n"
+            "version: 1\nmodel:\n  env:\n    NVME_ROOT: /mnt/nvme\n"
         )
         env, _ = resolve_for_model({"name": "m"}, tmp_path)
         assert env == {"NVME_ROOT": "/mnt/nvme"}
@@ -1053,3 +1070,56 @@ class TestAPushedImageIsTheOneThatRuns:
         i = src.index('_entry.get("registry_image")')
         j = src.index('docker_image_name.startswith("ci-")', i)
         assert i < j, "the local manifest key is still checked first"
+
+
+class TestHydraConfigParityForThisPipeline:
+    """Whether --config can replace --additional-context for the Jenkins pipeline.
+
+    Inert until ROCm/madengine#121 merges; active from the moment it does.
+
+    The answer is conditional, and the condition is the point. A plain user YAML
+    carrying our keys translates to a byte-identical context. Composing the same
+    thing from the `scheduler=slurm` GROUP does not: the group carries its own
+    defaults, so the run silently gains OMP_NUM_THREADS and MIOPEN_FIND_MODE plus
+    a dozen slurm keys nobody asked for. A benchmark whose environment changed
+    because of how its config was spelled is exactly the failure this project
+    exists to stop, so the pipeline stays on --additional-context and any future
+    move must use a plain YAML file, not groups.
+    """
+
+    OURS = {
+        "slurm": {
+            "partition": "amd-rccl",
+            "nodes": 2,
+            "gpus_per_node": 8,
+            "time": "04:00:00",
+            "exclusive": True,
+        },
+        "env_vars": {"TP_SIZE": "8"},
+    }
+
+    def test_a_plain_yaml_translates_to_an_identical_context(self):
+        translator = pytest.importorskip("madengine.config.translator")
+        omegaconf = pytest.importorskip("omegaconf")
+
+        cfg = omegaconf.OmegaConf.create(dict(self.OURS))
+        ctx, _meta = translator.ConfigTranslator.to_additional_context(cfg)
+        assert ctx == self.OURS
+
+    def test_a_scheduler_group_does_not(self):
+        """Not a defect in the group -- a reason not to compose from one here."""
+        translator = pytest.importorskip("madengine.config.translator")
+        omegaconf = pytest.importorskip("omegaconf")
+
+        group = omegaconf.OmegaConf.create(
+            {
+                "slurm": {"partition": "amd-rccl", "nodes": 1, "exclusive": True},
+                "env_vars": {"OMP_NUM_THREADS": "8", "MIOPEN_FIND_MODE": "1"},
+            }
+        )
+        merged = omegaconf.OmegaConf.merge(
+            group, omegaconf.OmegaConf.create({"slurm": {"nodes": 2}})
+        )
+        ctx, _meta = translator.ConfigTranslator.to_additional_context(merged)
+        assert ctx != self.OURS
+        assert "OMP_NUM_THREADS" in ctx["env_vars"]
