@@ -49,13 +49,13 @@ reproducing a number should pass a file rather than compose from groups.
 
 ## Any one of them is enough
 
-The four ways are **alternatives, not a stack**. They do not have to be active at
+These formats are **alternatives, not a stack**. They do not have to be active at
 the same time, and none of them is required:
 
 - a team with only a `cluster.sh` gets a working run;
 - a team with only a `models.yaml` gets a working run;
 - a team with only a `mad-config.yaml` gets a working run;
-- a team with none of them gets a working run, because ways 1–3 are read inside
+- a team with none of them gets a working run, because those formats are read inside
   the container by scripts madengine never parses.
 
 This is a rule about madengine, not about the formats: **nothing madengine adds on
@@ -69,12 +69,19 @@ copy, the `cp` failed and ended the run — after the image was built and the
 container was up, ten minutes into a two-node job. The fix was not to make the
 file mandatory but to make its absence survivable.
 
-`tests/unit/test_layered_config.py` asserts both halves: each way resolving alone,
-and each optional input missing without consequence.
+`tests/unit/test_layered_config.py` asserts both halves: each format resolving
+alone, and each optional input missing without consequence.
+
+The one thing that IS refused rather than skipped is a `site:` block in
+`mad-config.yaml`, and the distinction matters. Absence is a legitimate state, so
+it is survivable. A `site:` block is a setting its author expects to take effect,
+so ignoring it would leave them with a configuration that reads correctly and does
+nothing &mdash; the failure mode this rule exists to prevent, arrived at from the
+other direction.
 
 ---
 
-## Ways 1–3: what madengine does
+## The three formats madengine does not parse
 
 **It routes, validates and documents. It does not parse them.**
 
@@ -106,23 +113,37 @@ under madengine, and to `sbatch` under STANDALONE. madengine warns when it sees 
 ```
 
 For a distributed card, put the node count in `distributed.nnodes` and `slurm.nodes`,
-which both consumers read the same way. This is also why way 4 is pointed at by an
+which both consumers read the same way. This is also why `mad-config.yaml` is pointed at by an
 environment variable rather than by `args` — adding a third meaning to that field
 would make the ambiguity worse.
 
 ---
 
-## Way 4: `mad-config.yaml`
+## `mad-config.yaml`: a model's recipe and its measurement
 
-One file, three labelled sections, one per creation point.
+The other three formats are owned by the teams that authored them and are read
+inside the container by their own scripts. This one is madengine's, and it exists
+for a narrower job than it originally had: **the two things that travel with a
+model and that nothing else can express.**
+
+- **`model:`** &mdash; how this model is served on this hardware, including the
+  serve flags per role &times; mode. `configs/*.yaml` has no concept of a role,
+  and a Hydra group has no concept of a model.
+- **`benchmark:`** &mdash; what is measured, optionally per benchmark kind.
+
+It stops there. Anything true of the *cluster* rather than the *model* belongs to
+the run, and madengine composes that from Hydra groups or `cluster.sh`. A model
+card is the wrong place to describe a machine: the value outlives the wrong thing
+and goes stale where nobody is looking.
 
 ```yaml
 version: 1
 
-model:                      # created by: whoever tuned this model
-  id: moonshotai/Kimi-K3    # how way 2 names it
-  local_name: Kimi-K3       # how ways 1 and 3 name it (the on-disk directory)
+model:                      # decided by: whoever tuned this model
+  id: moonshotai/Kimi-K3    # how configs/*.yaml names it
+  local_name: Kimi-K3       # the on-disk directory, how models.yaml and cluster.sh name it
   env:
+    REQUIRE_LOCAL_WEIGHTS: '1'   # a fact about the MODEL: 1.5T will not load over NFS in time
     TP_SIZE: '8'
     PP_SIZE: '2'
   serve:
@@ -135,7 +156,7 @@ model:                      # created by: whoever tuned this model
       decode:
         tp: "--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512"
 
-benchmark:                  # created by: whoever defines the measurement
+benchmark:                  # decided by: whoever defines the measurement
   - env:                    # no 'kind' -> applies to every benchmark
       SEEDS: '3'
   - kind: niah
@@ -143,18 +164,44 @@ benchmark:                  # created by: whoever defines the measurement
       NIAH_WORDS: '10000,50000,100000,200000'
 ```
 
+### What is no longer in this file
+
+Earlier versions carried a `site:` section. Hydra's `+profile` and `+env` groups
+cover the same ground at the right scope &mdash; chosen per run, by whoever
+launches &mdash; so it is gone, and a file that still has one is **refused with an
+error naming where each kind of key should go**. It is not ignored. A setting that
+looks applied and is not is the failure this whole document is about, and
+silently dropping one would be an unusually poor way to make that point.
+
+Where a `site:` key goes depends on what it actually described:
+
+| it was really... | it now lives in | example |
+|---|---|---|
+| a property of the **model** | `model.env` here | `REQUIRE_LOCAL_WEIGHTS` &mdash; Kimi-K3 is 1.5T |
+| a property of the **cluster** | `cluster.sh`, as `${VAR:-default}` | `NVME_ROOT`, `KV_IB_DEVICE`, the fabric archetype |
+| a property of **this run** | a Hydra `+profile` / `+env` group | `NCCL_DEBUG`, `GPU_MAX_HW_QUEUES` |
+
+The split is usually obvious once the question is asked, and where it is not, the
+value was doing two jobs and should be two values.
+
 ### Where it is found
 
-A sibling `mad-config.yaml` next to the card's script directory, or an explicit path
-in `env_vars.MAD_CONFIG`. (The sibling-by-convention rule mirrors how the accuracy
-work locates a sibling `acc.yaml` next to `--config`.)
+A sibling `mad-config.yaml` next to the card's script directory, or an explicit
+path in `env_vars.MAD_CONFIG`. (The sibling-by-convention rule mirrors how the
+accuracy work locates a sibling `acc.yaml` next to `--config`.)
 
-No file means nothing changes — ways 1–3 are the common case and are untouched.
+No file means nothing changes. The other formats are the common case and are
+untouched &mdash; this one is opt-in, per card.
+
+Naming a file something other than `mad-config.yaml` and pointing at it with
+`MAD_CONFIG` is deliberate and useful: the default name is picked up by
+convention for **every** card in that directory, so a file meant for one card must
+not use it. `scripts/vllm_multinode/mad-config.kimi-k3.yaml` is there for exactly
+that reason.
 
 ### Precedence
 
-Lowest first. The last two are above the file so an operator pinning something at
-submit time still wins, which is what all three existing formats already rely on:
+Lowest first:
 
 ```
 model                                   from mad-config.yaml
@@ -166,10 +213,10 @@ additional_context.env_vars             -e, and everything --config composes (hi
 Layers **merge**, they do not replace: a key set only in `model` survives a
 `benchmark` section that does not mention it.
 
-There is no `site:` layer, and a file carrying one is **refused rather than
-ignored** -- a dropped setting that looks applied is the failure this whole
-document is about. Site facts belong to the run: a Hydra `+profile` / `+env`
-group, or `cluster.sh`.
+The last entry is where Hydra lands, so a run-level `--config +env=...` outranks
+anything a card declares. That ordering is deliberate: an operator pinning
+something at submit time should win, which is the property every one of these
+formats already relies on.
 
 ### Serve flags are a map, not a string
 
@@ -181,7 +228,7 @@ base: "--attention-backend aiter --tp 1"    # -> {--attention-backend: aiter, --
 modes: {tp: "--tp 8"}                       # -> --tp becomes '8', aiter survives
 ```
 
-This is the one thing way 4 does that way 1 cannot. `models.yaml` stores flags as an
+This is the one thing `mad-config.yaml` does that `models.yaml` cannot. `models.yaml` stores flags as an
 opaque string, so overriding one flag means string surgery — its own comments note
 that the moriio path "strips any duplicate from the yaml `tp:` string". A map removes
 the need for that.
@@ -191,7 +238,7 @@ Flags taking several values are kept whole: `--cuda-graph-bs 8 16 32` stays
 
 ### Why adopting it is safe
 
-Way 4 resolves into **exactly the `env_vars` a card already carries**. It is a front
+`mad-config.yaml` resolves into **exactly the `env_vars` a card already carries**. It is a front
 end, not a migration: no workload script changes, and no launcher needs to know the
 file exists. `tests/unit/test_layered_config.py` asserts this directly — a way-4 file
 and the equivalent hand-written `env_vars` block must resolve to identical
@@ -199,9 +246,11 @@ environments.
 
 ### Scope
 
-Way 4 is resolved by madengine, so it is available on the madengine path. The
+`mad-config.yaml` is resolved by madengine, so it is available on the madengine path. The
 STANDALONE Jenkins pipeline deliberately runs without installing madengine, so cards
-run that way should use ways 1–3.
+run that way should use the other three formats.
+
+---
 
 ---
 

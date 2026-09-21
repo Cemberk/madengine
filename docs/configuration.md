@@ -5,7 +5,7 @@ Complete guide to configuring madengine for various use cases and environments.
 ## Configuration Methods
 
 > Configuring a **distributed inference** workload? See
-> [Distributed Config](distributed-config.md) for the four supported ways and
+> [Distributed Config](distributed-config.md) for how the formats divide by scope and
 > how they layer.
 
 ### 1. Inline JSON String

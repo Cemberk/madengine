@@ -19,7 +19,7 @@ Complete documentation for madengine - AI model automation and distributed bench
 | [Batch Build](batch-build.md) | Selective builds with batch manifests |
 | [Deployment](deployment.md) | Kubernetes and SLURM deployment |
 | [Launchers](launchers.md) | Multi-node training frameworks |
-| [Distributed Config](distributed-config.md) | The four ways to configure distributed inference |
+| [Distributed Config](distributed-config.md) | Where each kind of setting belongs: run, site, model, measurement |
 
 ### Advanced Topics
 
