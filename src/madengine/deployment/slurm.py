@@ -572,10 +572,28 @@ class SlurmDeployment(BaseDeployment):
             if "yD" not in env_vars:
                 env_vars["yD"] = str(sglang_disagg_config.get("decode_nodes", 1))
 
-        # Override DOCKER_IMAGE_NAME with the built image from manifest
-        # This ensures the run uses the freshly built image, not the base image
-        # Priority: docker_image_name param > model_info.docker_image > env_vars.DOCKER_IMAGE_NAME
-        if docker_image_name and docker_image_name.startswith("ci-"):
+        # Override DOCKER_IMAGE_NAME with the built image from manifest.
+        #
+        # A PUSHED image wins over the manifest key. The key is the LOCAL build name
+        # (ci-<model>_<dockerfile>), while model_info["docker_image"] holds whatever
+        # the build recorded -- the registry reference when a push happened
+        # (build_orchestrator writes the registry image into all three fields).
+        # Preferring the key meant a successful push was then ignored: build 98
+        # pushed
+        #     rocm/mad-private:ci-vllm_multinode_..._pyt_vllm_kimi_k3_mi300x.ubuntu.amd
+        # and ran
+        #     ci-vllm_multinode_..._pyt_vllm_kimi_k3_mi300x.ubuntu.amd
+        # so the compute nodes got "pull access denied" for an image that was
+        # sitting in the registry under a name nobody passed them.
+        #
+        # The key is still the right answer when nothing was pushed -- a single-node
+        # run off a local build -- so it stays as the fallback.
+        _recorded = model_info.get("docker_image") or model_info.get("image") or ""
+        _pushed = bool(_recorded) and not _recorded.startswith("ci-")
+        if _pushed:
+            self.console.print(f"[cyan]Using pushed Docker image: {_recorded}[/cyan]")
+            env_vars["DOCKER_IMAGE_NAME"] = _recorded
+        elif docker_image_name and docker_image_name.startswith("ci-"):
             # The manifest key IS the built image name for madengine-built images
             self.console.print(
                 f"[cyan]Using built Docker image: {docker_image_name}[/cyan]"

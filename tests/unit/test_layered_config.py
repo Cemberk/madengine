@@ -1017,3 +1017,52 @@ class TestPushToADockerHubRepository:
                     f"{dep.nodes}-node run: the other nodes cannot pull it."
                 )
         assert "cannot pull it" in str(exc.value)
+
+
+class TestAPushedImageIsTheOneThatRuns:
+    """Build 98 pushed an image and then ran a name the nodes could not pull.
+
+        Successfully pushed: rocm/mad-private:ci-vllm_multinode_..._kimi_k3...
+        Using built Docker image: ci-vllm_multinode_..._kimi_k3...
+        docker: Error response from daemon: pull access denied
+
+    The manifest KEY is the local build name; model_info["docker_image"] carries
+    what the build recorded, which is the registry reference once a push happens.
+    Preferring the key threw the push away.
+    """
+
+    @staticmethod
+    def _pick(key, recorded):
+        """Mirrors the decision in _prepare_slurm_multi_script."""
+        rec = recorded or ""
+        if rec and not rec.startswith("ci-"):
+            return rec
+        if key and key.startswith("ci-"):
+            return key
+        return rec
+
+    def test_a_pushed_registry_image_wins(self):
+        assert (
+            self._pick("ci-kimi", "rocm/mad-private:ci-kimi")
+            == "rocm/mad-private:ci-kimi"
+        )
+
+    def test_a_local_build_with_no_push_still_uses_the_key(self):
+        """Single-node off a local build is a legitimate case."""
+        assert self._pick("ci-kimi", "ci-kimi") == "ci-kimi"
+
+    def test_a_use_image_override_is_honoured(self):
+        assert (
+            self._pick("rocm/mad-private:tag", "rocm/mad-private:tag")
+            == "rocm/mad-private:tag"
+        )
+
+    def test_the_source_prefers_the_recorded_image(self):
+        import inspect
+
+        from madengine.deployment import slurm as mod
+
+        src = inspect.getsource(mod)
+        i = src.index("_pushed = bool(_recorded)")
+        j = src.index('docker_image_name.startswith("ci-")', i)
+        assert i < j, "the local key is still being checked first"
