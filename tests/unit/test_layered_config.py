@@ -651,23 +651,26 @@ class TestComputeNodesCanPullAPrivateImage:
 
     @staticmethod
     def _emitted_login_block():
+        """The staging block as the compute node will actually see it.
+
+        Evaluated rather than scraped: these are f-strings, so a regex over the
+        source reports {{ where the script gets {. Two harness bugs hid behind
+        that while I was checking this block by hand.
+        """
         import inspect
-        import re
 
         from madengine.deployment import slurm as mod
 
         src = inspect.getsource(mod)
-        start = src.index(
-            '"# Authenticate to the registry, if credentials were exported to us.",'
+        i = src.index(
+            '"# Image staging, in the shape the STANDALONE path already proves'
         )
-        end = src.index('"# Pull Docker image in parallel on all nodes",', start)
-        seg = src[start:end]
-        out = []
-        for m in re.finditer(
-            r"^\s+(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"),\s*$", seg, re.M
-        ):
-            out.append(m.group(1) if m.group(1) is not None else m.group(2))
-        return "\n".join(out)
+        j = src.index('"",\n', src.index('"PULL_EXIT=$?",', i))
+        lines = eval(  # noqa: S307 - our own source, one bound name
+            "[\n" + src[i:j].rstrip().rstrip(",") + "\n]",
+            {"docker_image": "rocm/mad-private:tag"},
+        )
+        return "\n".join(lines)
 
     def test_a_login_is_emitted_before_the_pull(self):
         block = self._emitted_login_block()
@@ -692,16 +695,23 @@ class TestComputeNodesCanPullAPrivateImage:
         assert "-p " not in block and "--password " not in block
 
     def test_the_srun_body_has_no_apostrophes(self):
-        """One would close the single-quoted body and truncate the script."""
+        """One would close MAD_FETCH early and truncate what the node runs."""
         block = self._emitted_login_block()
-        i = block.index("bash -c '") + len("bash -c '")
-        j = block.index("\n    '", i)
+        i = block.index("MAD_FETCH='") + len("MAD_FETCH='")
+        j = block.index("\n'", i)
         assert block[i:j].count("'") == 0
+
+    def test_it_fans_out_one_task_per_node(self):
+        """Without this a node can be skipped, and then has no image at all."""
+        assert "--ntasks-per-node=1" in self._emitted_login_block()
+
+    def test_a_present_image_is_not_repulled(self):
+        assert "docker image inspect" in self._emitted_login_block()
 
     def test_missing_credentials_are_not_an_error(self):
         """A public image must still pull when nothing was exported."""
         block = self._emitted_login_block()
-        assert "pulling anonymously" in block
+        assert 'if [ -n "$_u" ] && [ -n "$_p" ]; then' in block
 
     def test_the_job_exports_its_environment(self):
         """Without this the credentials never reach the node to begin with."""
@@ -766,12 +776,10 @@ class TestNodeIPsAndLoginCannotBreakTheJob:
         assert "awk '{print $1}'" in blk
 
     def test_the_login_cannot_end_the_job(self):
-        """The script runs under set -e; a best-effort step must be guarded."""
-        blk = self._emitted(
-            '"# Authenticate to the registry',
-            '"# Pull Docker image in parallel on all nodes",',
-        )
-        assert "|| echo" in blk, "the login srun is unguarded under set -e"
+        """The script runs under set -e; only a failed PULL may stop it."""
+        blk = TestComputeNodesCanPullAPrivateImage._emitted_login_block()
+        assert "|| echo" in blk, "a failed login must not end the job"
+        assert "exit 1" in blk, "a failed pull must end the job"
 
     def test_the_generated_script_still_sets_e(self):
         """If this stops being true the guard above is merely harmless."""
