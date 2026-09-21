@@ -916,3 +916,42 @@ class TestTheHealthProbeCanActuallyReachANode:
 
         sel = SlurmNodeSelector.__new__(SlurmNodeSelector)
         assert getattr(sel, "partition", None) is None
+
+
+class TestCleanupCanActuallyCleanTheseNodes:
+    """Why a node was occupied with no SLURM job on it to explain it.
+
+    These workloads run in docker. `docker run` is attached here, but the
+    container belongs to the daemon, not to the job: scancel kills the job's
+    shell and the container keeps its GPU memory. The next allocation then finds
+    busy GPUs, which is what build 93 reported.
+    """
+
+    @staticmethod
+    def _src():
+        import inspect
+
+        from madengine.deployment import slurm_node_selector as mod
+
+        return inspect.getsource(mod)
+
+    def test_cleanup_stops_containers(self):
+        """Killing host processes alone never touches a running container."""
+        assert "docker stop" in self._src()
+
+    def test_cleanup_covers_sglang_not_only_vllm(self):
+        src = self._src()
+        assert 'pkill -9 -f "sglang"' in src
+
+    def test_cleanup_waits_for_gpu_memory_to_drain(self):
+        """A container stopped a moment ago still shows its memory as used."""
+        src = self._src()
+        i = src.index("CLEANUP_OK")
+        assert "sleep 5" in src[max(0, i - 500) : i]
+
+    def test_cleanup_names_the_partition_too(self):
+        """The probe was fixed for this; the cleanup had the same omission."""
+        src = self._src()
+        i = src.index("cleanup_script")
+        seg = src[i : i + 2500]
+        assert 'srun_cmd.append(f"--partition={self.partition}")' in seg

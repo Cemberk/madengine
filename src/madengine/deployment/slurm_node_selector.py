@@ -324,19 +324,31 @@ echo "===END_PROCESSES==="
         """
         # Cleanup script (consolidated from bash scripts)
         cleanup_script = """
+# Containers first. These workloads run inside docker, and a container outlives
+# the job that started it: scancel kills the job's shell, but the container
+# belongs to the docker daemon and keeps its GPU memory. That is how a node ends
+# up occupied with no SLURM job on it, and why killing host processes alone left
+# build 93 looking at busy GPUs.
+if command -v docker >/dev/null 2>&1; then
+    docker ps -q | xargs --no-run-if-empty docker stop --time 10 2>/dev/null || true
+fi
+
 # Kill Ray processes
 pkill -9 -f "ray::" 2>/dev/null || true
 pkill -9 -f "RayWorkerWrapper" 2>/dev/null || true
 pkill -9 -f "raylet" 2>/dev/null || true
 
-# Kill vLLM processes
+# Kill vLLM and SGLang processes. SGLang was missing entirely, so a node dirtied
+# by the sglang_disagg workloads was never cleaned by this.
 pkill -9 -f "vllm" 2>/dev/null || true
+pkill -9 -f "sglang" 2>/dev/null || true
 
 # Kill Ray Python workers
 pgrep -f "ray/_private/workers" | xargs -r kill -9 2>/dev/null || true
 
-# Give processes time to die
-sleep 2
+# Give processes time to die and the driver time to release GPU memory. A
+# container stopped a moment ago still shows its memory as used.
+sleep 5
 
 echo "CLEANUP_OK"
 """
@@ -348,6 +360,10 @@ echo "CLEANUP_OK"
             "--overlap",
             "--quiet",
         ]
+        # Same omission the probe had: without the partition a login node with no
+        # default rejects this outright, so cleanup silently never happens.
+        if self.partition:
+            srun_cmd.append(f"--partition={self.partition}")
         if job_name:
             srun_cmd.append(f"--job-name={job_name}")
         if self.reservation:
