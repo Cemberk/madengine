@@ -87,6 +87,10 @@ class SlurmNodeSelector:
             reservation: SLURM reservation name (passed through to srun health/cleanup)
         """
         self.console = console or Console()
+        # Set when select_nodes runs. The probe below needs it: a login node with no
+        # default partition rejects a bare srun, and the whole check then reports
+        # every node unreachable.
+        self.partition: Optional[str] = None
         self.auto_cleanup = auto_cleanup
         self.verbose = verbose
         self.timeout = timeout
@@ -217,6 +221,13 @@ echo "===END_PROCESSES==="
             "--overlap",  # Allow overlap with running jobs
             "--quiet",
         ]
+        # Without this the probe inherits whatever default partition the login node
+        # has -- on OCI amd-rccl there is none, so srun answers "Invalid
+        # specification" and every node is recorded UNREACHABLE. Five builds
+        # reported all 46-50 nodes unreachable for this reason, which is also why
+        # the check has been standing down instead of doing its job.
+        if self.partition:
+            srun_cmd.append(f"--partition={self.partition}")
         if job_name:
             srun_cmd.append(f"--job-name={job_name}")
         if self.reservation:
@@ -389,6 +400,9 @@ echo "CLEANUP_OK"
             - clean_nodes: List of clean node names (may be empty)
             - updated_exclude_list: Comma-separated list to pass to sbatch
         """
+        # The probe runs before any allocation exists, so it has to name the partition.
+        self.partition = partition
+
         self.console.print("\n[bold cyan]🔍 Checking GPU Node Health[/bold cyan]")
         self.console.print(
             f"Partition: [cyan]{partition}[/cyan] | "

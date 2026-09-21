@@ -873,3 +873,46 @@ class TestExclusiveDoesNotBreakEverySrun:
         """Unsetting the step variable must not give up the job-level allocation."""
         src = self._src()
         assert '"#SBATCH --exclusive"' in src
+
+
+class TestTheHealthProbeCanActuallyReachANode:
+    """Build 93 died on the condition this check exists to prevent:
+
+        RuntimeError: The memory capacity is unbalanced.
+                      Some GPUs may be occupied by other processes.
+
+    The check had reported every node UNREACHABLE for five builds and stood
+    down each time, because its own srun failed:
+
+        srun: error: Invalid specification
+
+    It ran without --partition, and the OCI login node has no default one.
+    """
+
+    @staticmethod
+    def _src():
+        import inspect
+
+        from madengine.deployment import slurm_node_selector as mod
+
+        return inspect.getsource(mod)
+
+    def test_the_probe_names_the_partition(self):
+        src = self._src()
+        assert 'srun_cmd.append(f"--partition={self.partition}")' in src
+
+    def test_select_nodes_records_the_partition_for_the_probe(self):
+        src = self._src()
+        i = src.index("def select_nodes(")
+        j = src.index("def ", i + 10)
+        assert "self.partition = partition" in src[i:j]
+
+    def test_the_probe_still_overlaps_a_running_job(self):
+        """Without --overlap it would queue behind the job it is inspecting."""
+        assert '"--overlap"' in self._src()
+
+    def test_a_selector_with_no_partition_yet_emits_no_flag(self):
+        from madengine.deployment.slurm_node_selector import SlurmNodeSelector
+
+        sel = SlurmNodeSelector.__new__(SlurmNodeSelector)
+        assert getattr(sel, "partition", None) is None
