@@ -788,3 +788,45 @@ class TestNodeIPsAndLoginCannotBreakTheJob:
         from madengine.deployment import slurm as mod
 
         assert '"set -e",' in inspect.getsource(mod)
+
+
+class TestFailuresAreVisibleInTheLog:
+    """Build 91's log ended after the node IPs and said nothing else.
+
+    Two independent reasons, both of which hide a failure rather than cause one.
+    """
+
+    @staticmethod
+    def _src():
+        import inspect
+
+        from madengine.deployment import slurm as mod
+
+        return inspect.getsource(mod)
+
+    def test_the_pull_status_is_reachable_under_set_e(self):
+        """`PULL_EXIT=$?` after a bare srun never runs while set -e is on."""
+        src = self._src()
+        i = src.index(
+            'srun --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 bash -c "$MAD_FETCH"'
+        )
+        before = src[max(0, i - 400) : i]
+        assert '"set +e",' in before, "the srun is not wrapped in set +e"
+        after = src[i : i + 300]
+        assert '"PULL_EXIT=$?",' in after and '"set -e",' in after
+
+    def test_stderr_is_streamed_not_only_stdout(self):
+        src = self._src()
+        assert "_{job_id}_*.err" in src, "the .err file is never read"
+
+    def test_the_two_streams_are_distinguishable(self):
+        """A reader has to be able to tell which stream a line came from."""
+        src = self._src()
+        i = src.index("_{job_id}_*.err")
+        seg = src[max(0, i - 400) : i + 200]
+        assert '"│"' in seg and '"┇"' in seg
+
+    def test_positions_are_tracked_per_file(self):
+        """Two files share one job id; a per-job position would interleave them."""
+        src = self._src()
+        assert "self._output_positions[output_file]" in src

@@ -789,8 +789,15 @@ class SlurmDeployment(BaseDeployment):
                     f"docker pull {docker_image} \\",
                     f'  || {{ echo "docker pull {docker_image} FAILED on $(hostname)" >&2; exit 1; }}',
                     "'",
+                    "# set +e around the call, because `PULL_EXIT=$?` is unreachable without",
+                    "# it: the script runs under `set -e`, so a non-zero srun exits here and",
+                    "# the diagnosis below never prints -- dead exactly when it is needed.",
+                    "# Build 91 stopped dead after the node IPs for this reason, with the real",
+                    "# message going to stderr and the collected stdout showing nothing.",
+                    "set +e",
                     'srun --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 bash -c "$MAD_FETCH"',
                     "PULL_EXIT=$?",
+                    "set -e",
                     "",
                     "if [ $PULL_EXIT -ne 0 ]; then",
                     "    echo 'Docker pull failed on one or more nodes'",
@@ -1699,41 +1706,49 @@ export MASTER_PORT={master_port}
         if not hasattr(self, "_output_positions"):
             self._output_positions = {}
 
-        # Find output file
+        # Stream BOTH streams. Only *.out was read here, so a job whose diagnosis
+        # went to stderr showed nothing at all: build 91 stopped after the node IPs
+        # with an empty-looking log, while the message naming the failure sat in the
+        # .err file nobody opened. Errors are the reason anyone reads this.
+        #
+        # Positions are keyed per FILE rather than per job, since two files are now
+        # tracked for the same job id.
         output_dir = str(self.output_dir)
-        output_pattern = f"{output_dir}/madengine-*_{job_id}_*.out"
 
         try:
             import glob
 
-            output_files = glob.glob(output_pattern)
+            streams = [
+                (
+                    sorted(glob.glob(f"{output_dir}/madengine-*_{job_id}_*.out")),
+                    "│",
+                    "dim cyan",
+                ),
+                (
+                    sorted(glob.glob(f"{output_dir}/madengine-*_{job_id}_*.err")),
+                    "┇",
+                    "yellow",
+                ),
+            ]
+            if not any(files for files, _, _ in streams):
+                return  # Neither file created yet
 
-            if not output_files:
-                return  # Output file not created yet
-
-            output_file = output_files[0]  # Use first match
-
-            # Read new content from file
-            try:
-                with open(output_file, "r") as f:
-                    # Seek to last position
-                    last_pos = self._output_positions.get(job_id, 0)
-                    f.seek(last_pos)
-
-                    # Read new lines
-                    new_content = f.read()
-
-                    if new_content:
-                        # Print new output with prefix
-                        for line in new_content.splitlines():
-                            if line.strip():  # Skip empty lines
-                                self.console.print(f"[dim cyan]│[/dim cyan] {line}")
-
-                    # Update position
-                    self._output_positions[job_id] = f.tell()
-
-            except FileNotFoundError:
-                pass  # File not ready yet
+            for files, marker, style in streams:
+                for output_file in files:
+                    try:
+                        with open(output_file, "r") as f:
+                            last_pos = self._output_positions.get(output_file, 0)
+                            f.seek(last_pos)
+                            new_content = f.read()
+                            if new_content:
+                                for line in new_content.splitlines():
+                                    if line.strip():
+                                        self.console.print(
+                                            f"[{style}]{marker}[/{style}] {line}"
+                                        )
+                            self._output_positions[output_file] = f.tell()
+                    except FileNotFoundError:
+                        pass  # File not ready yet
 
         except Exception as e:
             # Silently ignore streaming errors to not disrupt monitoring
