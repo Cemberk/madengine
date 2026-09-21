@@ -830,3 +830,46 @@ class TestFailuresAreVisibleInTheLog:
         """Two files share one job id; a per-job position would interleave them."""
         src = self._src()
         assert "self._output_positions[output_file]" in src
+
+
+class TestExclusiveDoesNotBreakEverySrun:
+    """Build 92's stderr, visible for the first time, named the cause:
+
+        │ Docker pull failed on one or more nodes
+        ┇ srun: error: Invalid --exclusive specification
+
+    sbatch --exclusive exports SLURM_EXCLUSIVE; srun re-parses it as a step
+    request and rejects it. Every srun in the job fails, the pull included.
+    STANDALONE never hits this: it carries the card's own directives, which set
+    -N, -n, --ntasks-per-node and --switches, but not --exclusive.
+    """
+
+    @staticmethod
+    def _src():
+        import inspect
+
+        from madengine.deployment import slurm as mod
+
+        return inspect.getsource(mod)
+
+    def test_slurm_exclusive_is_unset_in_the_job(self):
+        assert '"unset SLURM_EXCLUSIVE",' in self._src()
+
+    def test_it_is_unset_before_any_srun_runs(self):
+        src = self._src()
+        start = src.index("def _prepare_slurm_multi_script")
+        unset = src.index('"unset SLURM_EXCLUSIVE",', start)
+        sruns = [
+            i
+            for i in range(start, len(src))
+            if src.startswith("srun --", i)
+            or src.startswith("'srun --", i)
+            or src.startswith('"srun --', i)
+        ]
+        assert sruns, "no srun found to guard"
+        assert all(i > unset for i in sruns), "an srun precedes the unset"
+
+    def test_the_allocation_is_still_requested_exclusive(self):
+        """Unsetting the step variable must not give up the job-level allocation."""
+        src = self._src()
+        assert '"#SBATCH --exclusive"' in src

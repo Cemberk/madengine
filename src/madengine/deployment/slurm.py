@@ -675,6 +675,16 @@ class SlurmDeployment(BaseDeployment):
                 "",
                 "set -e",
                 "",
+                "# sbatch --exclusive exports SLURM_EXCLUSIVE into the job, and every srun",
+                "# inside then re-parses it as a STEP request and rejects the value:",
+                "#     srun: error: Invalid --exclusive specification",
+                "# The allocation is already exclusive -- that was granted at job level and",
+                "# nothing here gives it up. The steps running inside it simply do not need",
+                "# to ask for it again. Build 92 failed every srun in the job this way,",
+                "# including the image pull, and the STANDALONE path does not hit it because",
+                "# it carries the card's own directives, which do not set --exclusive.",
+                "unset SLURM_EXCLUSIVE",
+                "",
                 "# Environment variables",
             ]
         )
