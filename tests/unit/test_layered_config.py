@@ -1154,3 +1154,52 @@ class TestTheProbeWaitsLongEnoughToLearnSomething:
     def test_the_selector_actually_uses_it_for_both_probe_and_cleanup(self):
         src = self._src("madengine.deployment.slurm_node_selector")
         assert src.count("timeout=self.timeout") >= 2
+
+
+class TestTheTemplatedPathAlsoNeedsOnePathSegment:
+    """Build 130 reported COMPLETED in 33 seconds and produced nothing.
+
+        ✓ Submitted SLURM job: 441865
+        SLURM job 441865 final status: COMPLETED
+        │ 1 │ ❌ Failed │ sglang/pyt_sglang_kimi-k3 │
+
+    job.sh.j2 interpolates model_name straight into #SBATCH --output, and the
+    card's name is namespaced. sbatch could not write to
+    slurm_results/madengine-sglang/... so the job ended immediately with no log.
+
+    The identical fix went into the self-managed path's directives earlier. This
+    path spells it {{ model_name }} in a template, so the same sweep missed it --
+    the third time this bug has been found in a different spelling.
+    """
+
+    @staticmethod
+    def _src():
+        import inspect
+
+        from madengine.deployment import slurm as mod
+
+        return inspect.getsource(mod)
+
+    def test_the_template_context_is_sanitised(self):
+        assert '"model_name": self._safe_name(model_info),' in self._src()
+
+    def test_the_raw_name_is_still_available_as_a_label(self):
+        """Losing it entirely would make the generated script harder to read."""
+        assert '"model_display_name": model_info["name"],' in self._src()
+
+    def test_no_template_context_key_carries_a_raw_namespaced_name_into_a_path(self):
+        src = self._src()
+        i = src.index('"model_name": self._safe_name(model_info),')
+        j = src.index('"manifest_file"', i)
+        assert 'model_info["name"]' in src[i:j]  # only as model_display_name
+
+    def test_the_template_builds_paths_from_model_name(self):
+        """If the template stopped using it for paths, sanitising it would be moot."""
+        import pathlib
+
+        from madengine.deployment import slurm as mod
+
+        tpl = (
+            pathlib.Path(mod.__file__).parent / "templates" / "slurm" / "job.sh.j2"
+        ).read_text()
+        assert "#SBATCH --output={{ output_dir }}/madengine-{{ model_name }}" in tpl

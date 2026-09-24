@@ -1003,7 +1003,20 @@ class SlurmDeployment(BaseDeployment):
         )
 
         return {
-            "model_name": model_info["name"],
+            # job.sh.j2 interpolates this straight into #SBATCH --output and --error,
+            # so it has to be ONE path segment. Discovery namespaces a card found in a
+            # nested models.json -- "sglang/pyt_sglang_kimi-k3" -- and the raw name sent
+            # --output at slurm_results/madengine-sglang/pyt_..._%j_%t.out, a directory
+            # nobody creates. sbatch cannot write there, so the job ends in seconds with
+            # no output at all: build 130 reported COMPLETED in 33s, madengine marked the
+            # model Failed, and the console carried nothing to explain either.
+            #
+            # The same fix was applied to the self-managed path's directives; this is the
+            # templated path, which spells it {{ model_name }} in the template and so was
+            # not caught by the same sweep.
+            "model_name": self._safe_name(model_info),
+            # The unsanitised name where it is a LABEL rather than a path.
+            "model_display_name": model_info["name"],
             "manifest_file": os.path.abspath(self.config.manifest_file),
             "partition": self.partition,
             "nodes": self.nodes,
