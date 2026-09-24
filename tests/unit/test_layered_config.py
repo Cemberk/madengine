@@ -1123,3 +1123,34 @@ class TestHydraConfigParityForThisPipeline:
         ctx, _meta = translator.ConfigTranslator.to_additional_context(merged)
         assert ctx != self.OURS
         assert "OMP_NUM_THREADS" in ctx["env_vars"]
+
+
+class TestTheProbeWaitsLongEnoughToLearnSomething:
+    """Build 105's health check reported every node "Unreachable / Timeout".
+
+    The --exclusive leak was fixed, so the probe finally ran -- and then hit a
+    30-second ceiling. That ceiling is not a command runtime: the probe srun has
+    to WAIT for the scheduler before it executes anything, and with a dozen jobs
+    queued it never got a slot. The check stood down having learned nothing,
+    which is the same blindness as before by a different route.
+    """
+
+    @staticmethod
+    def _src(mod_name):
+        import importlib
+        import inspect
+
+        return inspect.getsource(importlib.import_module(mod_name))
+
+    def test_the_default_covers_a_busy_queue(self):
+        src = self._src("madengine.deployment.slurm_node_selector")
+        assert "timeout: int = 120," in src
+
+    def test_it_is_configurable_per_cluster(self):
+        """No single number fits both a quiet cluster and a full one."""
+        src = self._src("madengine.deployment.slurm")
+        assert 'self.slurm_config.get("node_check_timeout", 120)' in src
+
+    def test_the_selector_actually_uses_it_for_both_probe_and_cleanup(self):
+        src = self._src("madengine.deployment.slurm_node_selector")
+        assert src.count("timeout=self.timeout") >= 2

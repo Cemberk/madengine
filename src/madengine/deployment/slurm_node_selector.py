@@ -73,7 +73,7 @@ class SlurmNodeSelector:
         console: Optional[Console] = None,
         auto_cleanup: bool = False,
         verbose: bool = False,
-        timeout: int = 30,
+        timeout: int = 120,
         reservation: Optional[str] = None,
     ):
         """
@@ -83,7 +83,10 @@ class SlurmNodeSelector:
             console: Rich console for output
             auto_cleanup: Automatically clean dirty nodes
             verbose: Enable verbose logging
-            timeout: Timeout for srun commands (seconds)
+            timeout: Seconds to wait for a probe srun. This is a QUEUE wait, not a
+                command runtime: the probe cannot start until the scheduler gives it
+                a slot, so the value has to cover how long that takes on a busy
+                cluster. Override with slurm.node_check_timeout.
             reservation: SLURM reservation name (passed through to srun health/cleanup)
         """
         self.console = console or Console()

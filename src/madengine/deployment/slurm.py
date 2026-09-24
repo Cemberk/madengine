@@ -1498,11 +1498,21 @@ export MASTER_PORT={master_port}
             and not self.slurm_config.get("nodelist")
         ):
             try:
+                # The probe srun has to WAIT for the scheduler, not just run. 30s is
+                # fine on an idle cluster and far too short on a busy one: with a dozen
+                # jobs queued, every node came back "Unreachable / Timeout" and the
+                # check stood down having learned nothing -- the same blindness the
+                # --exclusive leak caused, arrived at from a different direction.
+                #
+                # 120s by default, and configurable, because the right value is a
+                # property of the cluster's queue and no single number fits both a
+                # quiet cluster and a full one.
                 selector = SlurmNodeSelector(
                     console=self.console,
                     auto_cleanup=auto_cleanup,
                     verbose=self.slurm_config.get("verbose_node_check", False),
                     reservation=self.reservation,
+                    timeout=int(self.slurm_config.get("node_check_timeout", 120)),
                 )
                 clean_nodes, updated_exclude = selector.select_nodes(
                     partition=self.partition,
