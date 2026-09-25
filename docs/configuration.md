@@ -582,6 +582,7 @@ in [examples/k8s-configs/README.md](../examples/k8s-configs/README.md).
 - `modules` - Array of environment modules to `module load` in the job (default: `[]`)
 - `network_interface` - Interface exported as `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` (e.g. `ib0`)
 - `output_dir` - Directory for SLURM `.out`/`.err` files (default: `./slurm_results`)
+- `gpu_arch` - GPU architecture of the compute nodes (e.g. `"gfx942"`), used to enforce a model card's `skip_gpu_arch` before submission. madengine runs on the login node, which has no GPUs, so when this is unset it probes one node of `partition` with `srun ... rocminfo` (waiting up to `node_check_timeout`). If the probe cannot run, the model is submitted anyway with a warning that `skip_gpu_arch` was not enforced. `--disable-skip-gpu-arch` bypasses the check and the probe.
 - `skip_gpus_directive` - Omit the `#SBATCH --gpus-per-node` directive (default: `false`). Set `true` on clusters that expose no GPU GRES and reject any job script carrying it; allocation then relies on `exclusive` / `nproc_per_node`.
 
 Node health preflight, shared-storage, and results-collection keys (`enable_node_check`,

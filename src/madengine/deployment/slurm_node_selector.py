@@ -11,6 +11,7 @@ Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 """
 
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -19,6 +20,33 @@ from typing import List, Optional, Tuple
 
 from rich.console import Console
 from rich.table import Table
+
+
+# rocminfo lists the CPU agents first ("Name: AMD EPYC ...") and the GPU agents
+# after them ("Name: gfx942"), so the first gfx token is the GPU's ISA name. The
+# suffix is hex -- gfx90a is a real target -- so [0-9] alone would read it as gfx90.
+_GFX_ARCH_RE = re.compile(r"\bgfx[0-9a-f]+\b")
+
+
+def parse_gpu_arch(output: Optional[str]) -> Optional[str]:
+    """Return the first gfx architecture named in rocminfo output, or None."""
+    if not output:
+        return None
+    match = _GFX_ARCH_RE.search(output)
+    return match.group(0) if match else None
+
+
+def _first_plain_node(nodelist: Optional[str]) -> Optional[str]:
+    """First node of a comma-separated nodelist, or None if it is not plain.
+
+    A bracketed range ("node[01-04]") cannot be split on commas, and passing the
+    whole list with -N1 is rejected by srun, so such a list is left out and the
+    probe falls back to the partition's choice.
+    """
+    if not nodelist or "[" in nodelist:
+        return None
+    first = nodelist.split(",")[0].strip()
+    return first or None
 
 
 class NodeHealth(Enum):
@@ -313,6 +341,84 @@ echo "===END_PROCESSES==="
                 process_count=0,
                 error_message=str(e)[:100],
             )
+
+    def probe_gpu_arch(
+        self,
+        partition: str,
+        constraint: Optional[str] = None,
+        exclude: Optional[str] = None,
+        nodelist: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Ask one compute node of the partition which GPU architecture it has.
+
+        madengine runs SLURM deployments from the login node, which has no GPUs,
+        so the architecture a model card's skip_gpu_arch is compared against has
+        to come from the nodes the job will land on. One srun of rocminfo on the
+        same partition, reservation and constraint the job uses answers that.
+
+        Uses the same queue-wait timeout as the health probe: it is an srun too,
+        and on a busy cluster it waits for a slot before it runs anything.
+
+        Returns:
+            The gfx name (e.g. "gfx942"), or None if the probe could not run or
+            printed no gfx agent. None means UNKNOWN, never "not this arch".
+        """
+        job_name = f"madengine_archprobe_{os.getpid()}_{int(time.time())}"
+        # rocminfo is often not on a non-login PATH; /opt/rocm/bin is where ROCm
+        # installs it.
+        probe_script = 'PATH="$PATH:/opt/rocm/bin" rocminfo 2>/dev/null'
+        srun_cmd = [
+            "srun",
+            "--nodes=1",
+            "--ntasks=1",
+            "--time=00:01:00",
+            "--overlap",
+            "--quiet",
+            f"--job-name={job_name}",
+        ]
+        # Named for the same reason check_node_health names it: a login node with
+        # no default partition rejects a bare srun.
+        if partition:
+            srun_cmd.append(f"--partition={partition}")
+        if self.reservation:
+            srun_cmd.append(f"--reservation={self.reservation}")
+        if constraint:
+            srun_cmd.append(f"--constraint={constraint}")
+        node = _first_plain_node(nodelist)
+        if node:
+            srun_cmd.append(f"--nodelist={node}")
+        elif exclude:
+            srun_cmd.append(f"--exclude={exclude}")
+        srun_cmd.extend(["bash", "-c", probe_script])
+
+        try:
+            result = subprocess.run(
+                srun_cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            self.console.print(
+                f"[yellow]⚠ GPU architecture probe timed out after {self.timeout}s "
+                f"waiting for a node in {partition}[/yellow]"
+            )
+            return None
+        except Exception as e:
+            self.console.print(f"[yellow]⚠ GPU architecture probe failed: {e}[/yellow]")
+            return None
+        finally:
+            # A probe that timed out is still queued; do not leave it behind.
+            SlurmNodeSelector.cancel_health_check_jobs(job_name, self.console)
+
+        if result.returncode != 0:
+            self.console.print(
+                f"[yellow]⚠ GPU architecture probe srun failed: "
+                f"{(result.stderr or '').strip()[:200]}[/yellow]"
+            )
+            return None
+        return parse_gpu_arch(result.stdout)
 
     def cleanup_node(self, node: str, job_name: Optional[str] = None) -> bool:
         """

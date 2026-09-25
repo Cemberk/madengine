@@ -16,7 +16,7 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from rich.console import Console as RichConsole
 from rich.panel import Panel
@@ -744,6 +744,28 @@ class RunOrchestrator:
                 f"{', '.join(_active_local_flags)}[/yellow]\n"
             )
 
+        # skip_gpu_arch used to be enforced only by _execute_local, so a card
+        # declaring `skip_gpu_arch: gfx950` was sbatched onto gfx950 nodes and
+        # failed there instead of being skipped. It has to be decided before
+        # submission, and for every launcher -- slurm_multi runs the card's own
+        # script with no madengine on the compute node to catch it later.
+        skipped_runs = []
+        # A missing manifest is the deployment's error to report, with its own
+        # message; this check only filters one that exists.
+        if target == "slurm" and os.path.exists(manifest_file):
+            remaining, skipped = self._apply_skip_gpu_arch_for_slurm(manifest_file)
+            # Same shape container_runner reports a skipped run in, so the
+            # Execution Results table lists the model instead of omitting it.
+            skipped_runs = [
+                {"model": name, "status": "SKIPPED", "performance": None, "duration": None}
+                for name in skipped
+            ]
+            if not remaining:
+                self.rich_console.print(
+                    "[yellow]All models skipped by skip_gpu_arch; nothing to submit.[/yellow]\n"
+                )
+                return {"successful_runs": skipped_runs, "failed_runs": []}
+
         # Import from deployment layer
         from madengine.deployment.factory import DeploymentFactory
         from madengine.deployment.base import DeploymentConfig
@@ -798,11 +820,11 @@ class RunOrchestrator:
         # Extract successful_runs and failed_runs from metrics if available
         if result.metrics:
             return {
-                "successful_runs": result.metrics.get("successful_runs", []),
+                "successful_runs": skipped_runs + result.metrics.get("successful_runs", []),
                 "failed_runs": result.metrics.get("failed_runs", []),
             }
         else:
-            return {"successful_runs": [], "failed_runs": []}
+            return {"successful_runs": skipped_runs, "failed_runs": []}
 
     def _show_node_info(self):
         """Show node ROCm information."""
@@ -1110,6 +1132,105 @@ class RunOrchestrator:
             )
             self._write_skipped_status(model_name, image_info, gpu_arch)
         return compatible_images
+
+    def _resolve_slurm_gpu_arch(self, slurm_config: Dict) -> Optional[str]:
+        """
+        GPU architecture of the compute nodes a SLURM job will run on.
+
+        get_system_gpu_architecture() is what the local path uses, and on a SLURM
+        login node it describes a machine with no GPUs. So: slurm.gpu_arch if the
+        caller states it, otherwise one srun of rocminfo on the target partition.
+
+        Returns None when neither yields an answer. The caller must treat that as
+        unknown -- skipping a model because its arch could not be read would drop
+        it from a run with no evidence it was unsupported.
+        """
+        explicit = str(slurm_config.get("gpu_arch") or "").strip()
+        if explicit:
+            self.rich_console.print(
+                f"[dim]  Target GPU architecture from slurm.gpu_arch: {explicit}[/dim]"
+            )
+            return explicit
+
+        from madengine.deployment.slurm_node_selector import SlurmNodeSelector
+
+        partition = slurm_config.get("partition", "")
+        self.rich_console.print(
+            f"[dim]  Probing a node in partition {partition or '(default)'} "
+            f"for its GPU architecture (set slurm.gpu_arch to skip this)...[/dim]"
+        )
+        selector = SlurmNodeSelector(
+            console=self.rich_console,
+            reservation=slurm_config.get("reservation"),
+            timeout=int(slurm_config.get("node_check_timeout", 120)),
+        )
+        arch = selector.probe_gpu_arch(
+            partition=partition,
+            constraint=slurm_config.get("constraint"),
+            exclude=slurm_config.get("exclude"),
+            nodelist=slurm_config.get("nodelist"),
+        )
+        if arch:
+            self.rich_console.print(f"[dim]  Compute node GPU architecture: {arch}[/dim]")
+        return arch
+
+    def _apply_skip_gpu_arch_for_slurm(self, manifest_file: str) -> Tuple[int, List[str]]:
+        """
+        Drop models whose skip_gpu_arch names the SLURM nodes' architecture.
+
+        Same rule and same SKIPPED rows as the local path, applied before sbatch.
+        The manifest file is rewritten because the deployment reads it back and
+        submits built_models' first entry: a skipped model has to leave
+        built_models as well as built_images, or it is the one that gets
+        submitted.
+
+        Returns:
+            (number of models left to submit, names of the models skipped)
+        """
+        with open(manifest_file, "r") as f:
+            manifest = json.load(f)
+        built_images = manifest.get("built_images", {})
+        built_models = manifest.get("built_models", {})
+
+        if getattr(self.args, "disable_skip_gpu_arch", False):
+            self.rich_console.print(
+                "[dim]  --disable-skip-gpu-arch flag set, skipping GPU architecture checks[/dim]"
+            )
+            return len(built_images), []
+
+        # The probe costs an srun that may queue for minutes; spend it only when
+        # some card actually restricts its architecture.
+        if not any(built_models.get(k, {}).get("skip_gpu_arch") for k in built_images):
+            return len(built_images), []
+
+        from madengine.deployment.config_loader import ConfigLoader
+
+        # Resolved through the same loader SlurmDeployment uses, so the probe
+        # targets the partition the job will be submitted to, defaults included.
+        slurm_config = ConfigLoader.load_slurm_config(self.additional_context).get("slurm", {})
+
+        self.rich_console.print("[cyan]Checking skip_gpu_arch model restrictions...[/cyan]")
+        gpu_arch = self._resolve_slurm_gpu_arch(slurm_config)
+        if not gpu_arch:
+            restricted = [k for k in built_images if built_models.get(k, {}).get("skip_gpu_arch")]
+            self.rich_console.print(
+                "[bold yellow]⚠️  skip_gpu_arch could NOT be enforced: the compute nodes' "
+                "GPU architecture is unknown (probe failed or found no gfx agent). "
+                f"Submitting anyway: {', '.join(restricted)}. "
+                "Set slurm.gpu_arch in --additional-context to enforce it.[/bold yellow]"
+            )
+            return len(built_images), []
+
+        compatible = self._filter_images_by_skip_gpu_arch(built_images, built_models, gpu_arch)
+        skipped = [k for k in built_images if k not in compatible]
+        if not skipped:
+            return len(compatible), []
+
+        manifest["built_images"] = compatible
+        manifest["built_models"] = {k: v for k, v in built_models.items() if k not in skipped}
+        with open(manifest_file, "w") as f:
+            json.dump(manifest, f, indent=2)
+        return len(compatible), [built_models.get(k, {}).get("name", k) for k in skipped]
 
     def _write_skipped_status(self, model_name: str, image_info: Dict, gpu_arch: str) -> None:
         """Write SKIPPED status to perf CSV for models that were skipped.
