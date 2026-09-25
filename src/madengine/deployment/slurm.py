@@ -44,7 +44,7 @@ from .common import (
     is_self_managed_launcher,
     normalize_launcher,
 )
-from .config_loader import ConfigLoader, apply_deployment_config
+from .config_loader import PRESET_ENV_KEYS, ConfigLoader, apply_deployment_config
 from .primus_backend import infer_primus_backend_from_model_name, merged_primus_config
 from .slurm_node_selector import SlurmNodeSelector
 
@@ -432,6 +432,42 @@ class SlurmDeployment(BaseDeployment):
             self.console.print(f"[red]✗ Failed to generate script: {e}[/red]")
             return False
 
+    def _user_env_vars(self) -> Dict[str, str]:
+        """additional_context.env_vars without the keys only a preset set.
+
+        For the self-managed path. load_slurm_config merges the slurm preset
+        profiles' env_vars into additional_context.env_vars, where they become
+        indistinguishable from what the user asked for. The templated launchers
+        rely on them. A slurm_multi card does not: it runs its own launcher
+        script, which owns its environment, and the same card submitted without
+        madengine (Jenkins STANDALONE, `sbatch --export=ALL` of the card script)
+        never receives them. Exporting them anyway makes the madengine run a
+        different experiment from the standalone one.
+
+        It is not hypothetical. MAD's run_xPyD_models.slurm sources a connector
+        env that sets HSA_ENABLE_SDMA=1 but forwards `-e K=${K:-default}`, so the
+        multi-node profile's HSA_ENABLE_SDMA=0 won: SDMA was off under madengine
+        and on under STANDALONE. The same profile's NCCL_SOCKET_IFNAME=eth0
+        preempts the card's own fabric detection (eno0 on AINIC, fenic0 on
+        Thor2), and NCCL_IB_DISABLE=1 would push NCCL onto TCP in any launcher
+        that forwards it.
+
+        Only preset-ONLY keys are dropped: a user who sets NCCL_IB_DISABLE
+        themselves still gets exactly their value, and the card's env_vars,
+        docker_env_vars and layered config are untouched.
+        """
+        env = dict(self.config.additional_context.get("env_vars") or {})
+        preset_only = self.config.additional_context.get(PRESET_ENV_KEYS) or []
+        dropped = sorted(k for k in preset_only if k in env)
+        for key in dropped:
+            del env[key]
+        if dropped:
+            self.console.print(
+                f"[dim]Not exporting SLURM preset env to the self-managed script "
+                f"(set them in env_vars to keep them): {', '.join(dropped)}[/dim]"
+            )
+        return env
+
     @staticmethod
     def _normalize_nodelist(nodelist: Optional[str]) -> Optional[str]:
         """Normalize nodelist to comma-separated without spaces for #SBATCH --nodelist."""
@@ -475,6 +511,7 @@ class SlurmDeployment(BaseDeployment):
 
         # Get environment variables
         env_vars = {}
+        user_env = self._user_env_vars()
 
         # Layered config (the fourth way), when this card has one. Seeded FIRST so
         # the card's own env_vars and any submit-time override below still win.
@@ -485,7 +522,7 @@ class SlurmDeployment(BaseDeployment):
             layered_env, layered_warnings = resolve_for_model(
                 model_info,
                 model_script_path.parent,
-                runtime_env=self.config.additional_context.get("env_vars"),
+                runtime_env=user_env,
             )
         except LayeredConfigError as exc:
             self.console.print(f"[red]✗ {exc}[/red]")
@@ -510,9 +547,8 @@ class SlurmDeployment(BaseDeployment):
         if "env_vars" in model_info:
             env_vars.update(model_info["env_vars"])
 
-        # From additional_context.env_vars
-        if "env_vars" in self.config.additional_context:
-            env_vars.update(self.config.additional_context["env_vars"])
+        # From additional_context.env_vars -- the user's, not the preset's.
+        env_vars.update(user_env)
 
         # Tools (profiling) on the self-managed path.
         #

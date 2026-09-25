@@ -1328,6 +1328,18 @@ exit 0
             # Get env_vars and filter out MIOPEN_USER_DB_PATH
             # This variable must be set per-process in multi-GPU training to avoid database conflicts
             env_vars = self.additional_context.get("env_vars", {}).copy()
+
+            # Save what the USER supplied, not what a SLURM preset profile filled
+            # in. The run phase re-applies the presets itself; saved here, their
+            # values came back as this run's additional_context.env_vars and could
+            # no longer be told apart from the user's -- which is exactly the
+            # distinction a slurm_multi card needs (see
+            # SlurmDeployment._user_env_vars).
+            from madengine.deployment.config_loader import PRESET_ENV_KEYS
+
+            for key in self.additional_context.get(PRESET_ENV_KEYS, []):
+                env_vars.pop(key, None)
+
             if "MIOPEN_USER_DB_PATH" in env_vars:
                 del env_vars["MIOPEN_USER_DB_PATH"]
                 print("ℹ️  Filtered MIOPEN_USER_DB_PATH from env_vars (will be set per-process in training)")
